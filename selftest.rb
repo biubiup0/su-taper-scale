@@ -16,12 +16,15 @@ module BanTaperScaleSelfTest
   BOX = Ban::TaperScale::DeformBox
   MATH = Ban::TaperScale::DeformMath
   TOLERANCE = 0.0001
+  TEST_MARK = 'BanTaperScaleSelfTest'.freeze
 
   def self.run
     @passed = []
     @failed = []
 
     model = Sketchup.active_model
+    clean_up(model)
+
     model.start_operation('收分缩放自检', true)
     begin
       group = build_column(model)
@@ -31,10 +34,29 @@ module BanTaperScaleSelfTest
       check_tapered(vertices)
       check_reset(set)
     ensure
-      model.abort_operation
+      # 先整体回滚；再兜底删除测试几何（SketchUp 的推/拉等操作可能会
+      # 隐含提交外层 operation，导致 abort 回滚不完整）
+      begin
+        model.abort_operation
+      rescue StandardError
+        nil
+      end
+      clean_up(model)
     end
 
     report
+  end
+
+  # 只删除自检自己创建的、带标记的测试几何
+  def self.clean_up(model)
+    model.active_entities.to_a.each do |entity|
+      next unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+      next unless entity.respond_to?(:name) && entity.name == TEST_MARK
+
+      entity.erase!
+    end
+  rescue StandardError
+    nil
   end
 
   # ---- 测试动作 ------------------------------------------------------------
@@ -45,6 +67,7 @@ module BanTaperScaleSelfTest
       [0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]
     )
     face.pushpull(100)
+    group.name = TEST_MARK
     group
   end
 
