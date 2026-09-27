@@ -19,15 +19,11 @@ module Ban
       @ui_ready == true
     end
 
-    # 启动工具。要求当前有选择集。
+    # 启动工具。不需要先选中对象：启动后直接点击要变形的对象即可。
     def self.start_tool
       model = Sketchup.active_model
       if model.nil?
         UI.messagebox('当前没有打开模型。')
-        return
-      end
-      if model.selection.empty?
-        UI.messagebox("请先选中要变形的对象（组 / 组件 / 几何体），\n再点「变形框收分缩放」。")
         return
       end
       model.select_tool(Tool.new)
@@ -36,8 +32,8 @@ module Ban
     unless file_loaded?(__FILE__)
       command = UI::Command.new('变形框收分缩放') { Ban::TaperScale.start_tool }
       command.tooltip = '变形框收分缩放'
-      command.status_bar_text = '先选中对象，再点这里建立变形框：拉伸缩放 / 收分，可锁定方向轴并精确输入'
-      # 始终可点：未选中对象时点击会给出提示（比灰掉更容易理解）
+      command.status_bar_text = '点这里，然后直接在模型里点击要变形的对象（组 / 组件 / 几何体）'
+      # 始终可点：点了之后再选择对象
       command.set_validation_proc { MF_ENABLED }
 
       icon_dir = File.join(File.dirname(__FILE__), 'icons')

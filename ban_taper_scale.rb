@@ -8,7 +8,7 @@ require 'extensions.rb'
 module Ban
   module TaperScale
     EXTENSION_NAME    = '变形框收分缩放'.freeze
-    EXTENSION_VERSION = '1.1.1'.freeze
+    EXTENSION_VERSION = '1.1.2'.freeze
     EXTENSION_ID      = 'ban_taper_scale'.freeze
 
     unless file_loaded?(__FILE__)
@@ -16,8 +16,8 @@ module Ban
         EXTENSION_NAME,
         File.join(EXTENSION_ID, 'main')
       )
-      extension.description = '用一个可自由摆放的变形框对所选对象做拉伸缩放与收分（锥化），' \
-                              '支持锁定方向轴、拖动实时预览、吸附到目标点以及精确增量输入。'
+      extension.description = '点命令后直接在模型里点击要变形的对象：用一个可自由摆放的变形框做拉伸缩放与收分（锥化），' \
+                              '支持锁定方向轴、吸附到目标点以及精确增量输入。'
       extension.version     = EXTENSION_VERSION
       extension.creator     = 'ban'
       extension.copyright   = "© #{Time.now.year} ban"
