@@ -17,6 +17,7 @@
 
 - Ruby：使用 SketchUp 自带版本（2019+ 为 Ruby 2.5/2.7，2023+ 为 Ruby 3.2），代码均兼容。
 - 实测环境：**macOS + SketchUp 2026 (26.2.242) + Ruby 3.2.2**。
+- 代码规模：约 1900 行（含详细中文注释），无死代码（可用 `ruby tools/find_dead.rb` 复扫）。
 
 ---
 
@@ -163,7 +164,7 @@ t = 沿收分轴的归一化位置（固定端 = 0，收分端 = 1）
 load '<本仓库路径>/selftest.rb'
 ```
 
-它会在模型里临时建一根柱子、跑一遍收分、校验顶点结果，然后**先回滚、再兜底删除测试几何**，不会留下任何东西。
+它先检查扩展是否注册完成，再在模型里临时建一根柱子、跑一遍收分、校验顶点结果，然后**先回滚、再兜底删除测试几何**，不会留下任何东西。
 
 ---
 
@@ -181,10 +182,15 @@ load '<本仓库路径>/selftest.rb'
 | `ban_taper_scale/settings.rb` | 偏好设置（吸附、保持造型等）|
 | `selftest.rb` | 真机自检脚本（不留下测试几何）|
 | `tools/build.rb` | 生成图标并打包 .rbz |
+| `tools/find_dead.rb` | 静态扫描未使用的方法 / 常量 |
 
 ---
 
 ## 更新日志
+
+### v1.2.7
+- **清理死代码**：移除未被引用的 `COLOR_TEXT`、`toggle_middle_stretch`、`DeformMath.stretch_point`、`DeformBox#size`、`DeformBox#center`、`VecMath.add`、`VertexSet#empty?`；新增 `tools/find_dead.rb` 可一键复查（当前报告为 0）。
+- `selftest.rb` 增加「扩展菜单 / 工具栏注册完成」检查（`ui_ready?`）。
 
 ### v1.2.6
 - 模式切换按钮：半透明橙色圆角底 + 「切换模式」，文字按绝对值精确上下左右居中；启动提示文字下移，不与按钮重叠。
