@@ -94,10 +94,6 @@ module Ban
 
       # ---- 几何查询 ------------------------------------------------------
 
-      def size(index)
-        @sizes[index]
-      end
-
       # 归一化坐标 (0..1) -> 世界坐标
       def point_at(x, y, z)
         point = VecMath.point_plus(@origin, VecMath.scale(@axes[0], x * @sizes[0]))
@@ -139,10 +135,6 @@ module Ban
         coords = [0.5, 0.5, 0.5]
         coords[axis_index] = side
         point_at(coords[0], coords[1], coords[2])
-      end
-
-      def center
-        point_at(0.5, 0.5, 0.5)
       end
 
       def with(sizes, origin = nil)

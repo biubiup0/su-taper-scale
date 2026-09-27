@@ -26,10 +26,6 @@ module Ban
         @entries.size
       end
 
-      def empty?
-        @entries.empty?
-      end
-
       # 收集到的顶点（可用于调试 / 自检）
       def vertices
         @entries.map { |entry| entry.vertex }

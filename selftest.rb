@@ -12,6 +12,11 @@ unless defined?(Ban::TaperScale::VertexSet)
   raise '未找到 Ban::TaperScale，请先安装「变形框收分缩放」扩展并重启 SketchUp。'
 end
 
+# 扩展的菜单 / 工具栏是否注册成功（曾经出现过加载一半失败的情况）
+unless Ban::TaperScale.respond_to?(:ui_ready?) && Ban::TaperScale.ui_ready?
+  raise '扩展的菜单 / 工具栏没有注册完成，请重启 SketchUp 后再试。'
+end
+
 module BanTaperScaleSelfTest
   BOX = Ban::TaperScale::DeformBox
   MATH = Ban::TaperScale::DeformMath

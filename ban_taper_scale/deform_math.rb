@@ -30,15 +30,6 @@ module Ban
         origin
       end
 
-      # 把点从原框映射到"拉伸后"的新框。
-      def stretch_point(box, anchors, new_sizes, point)
-        origin = stretch_origin(box, anchors, new_sizes)
-        n = box.normalize(point)
-        result = VecMath.point_plus(origin, VecMath.scale(box.axes[0], n[0] * new_sizes[0]))
-        result = VecMath.point_plus(result, VecMath.scale(box.axes[1], n[1] * new_sizes[1]))
-        VecMath.point_plus(result, VecMath.scale(box.axes[2], n[2] * new_sizes[2]))
-      end
-
       def stretch_box(box, anchors, new_sizes)
         box.with(new_sizes, stretch_origin(box, anchors, new_sizes))
       end

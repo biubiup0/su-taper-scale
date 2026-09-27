@@ -22,14 +22,6 @@ module Ban
         )
       end
 
-      def add(first, second)
-        Geom::Vector3d.new(
-          first.x + second.x,
-          first.y + second.y,
-          first.z + second.z
-        )
-      end
-
       def sub(first, second)
         Geom::Vector3d.new(
           first.x - second.x,
