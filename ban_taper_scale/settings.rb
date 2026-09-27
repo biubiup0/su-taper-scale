@@ -25,6 +25,16 @@ module Ban
       def object_axes=(value)
         Sketchup.write_default(SECTION, 'object_axes', value ? true : false)
       end
+
+      # 拖动时是否吸附到几何（端点 / 中点 / 圆心 / 交点 / 边线 / 表面）
+      def snap?
+        value = Sketchup.read_default(SECTION, 'snap', true)
+        value.nil? ? true : value
+      end
+
+      def snap=(value)
+        Sketchup.write_default(SECTION, 'snap', value ? true : false)
+      end
     end
   end
 end
