@@ -20,11 +20,18 @@ module Ban
       PICK_PX = 11
       # 屏幕距离相差在这个范围内视为"重合"，此时取离相机更近的手柄
       PICK_TIE_PX = 0.5
+      # 拖动时吸附到几何特征点的屏幕半径（像素）
+      SNAP_PX = 12
       DRAG_TOLERANCE_PX = 2
       VERTEX_PREVIEW_LIMIT = 80_000
 
       MODE_ORDER = [:stretch, :taper].freeze
       MODE_LABEL = { stretch: '拉伸缩放', taper: '收分' }.freeze
+      MODE_HINT = {
+        stretch: '角点 + 面心手柄',
+        taper: '只有面心手柄（沿轴收分）'
+      }.freeze
+      FLASH_SECONDS = 1.8
 
       # 工具状态：等待选择对象 / 已有变形框
       STATE_SELECT = :select
@@ -36,6 +43,7 @@ module Ban
 
       COLOR_BOX           = Sketchup::Color.new(130, 130, 130)
       COLOR_BOX_ACTIVE    = Sketchup::Color.new(255, 152, 0)
+      COLOR_BOX_TAPER     = Sketchup::Color.new(150, 90, 220)
       COLOR_TAPER_GUIDE   = Sketchup::Color.new(0, 168, 122)
       COLOR_FACE_HANDLE   = Sketchup::Color.new(0, 122, 255)
       COLOR_CORNER_HANDLE = Sketchup::Color.new(255, 255, 255)
@@ -44,6 +52,7 @@ module Ban
       COLOR_TEXT          = Sketchup::Color.new(50, 50, 50)
       COLOR_AXIS_LOCK     = Sketchup::Color.new(0, 170, 120)
       COLOR_PREVIEW       = Sketchup::Color.new(0, 200, 255)
+      COLOR_SNAP          = Sketchup::Color.new(255, 0, 170)
 
       AXIS_LABEL = ['X', 'Y', 'Z'].freeze
 
@@ -85,6 +94,12 @@ module Ban
         @dpi = nil
         @message = ''
         @preview_entity = nil
+        @snap_tooltip = ''
+        @snapped = false
+        @snap_point = nil
+        @snap_kind = ''
+        @flash_text = ''
+        @flash_until = nil
       end
 
       # ------------------------------------------------------------ 生命周期
@@ -180,6 +195,9 @@ module Ban
         id = menu.add_item('收分时炸开圆/弧曲线') { toggle_explode_curves }
         menu.set_validation_proc(id) { Settings.explode_curves? ? MF_CHECKED : MF_ENABLED }
 
+        id = menu.add_item('拖动时吸附到几何（端点/中点/圆心）') { toggle_snap }
+        menu.set_validation_proc(id) { Settings.snap? ? MF_CHECKED : MF_ENABLED }
+
         menu.add_separator
         menu.add_item('退出工具') { Sketchup.active_model.select_tool(nil) }
         true
@@ -188,12 +206,36 @@ module Ban
       end
 
       def set_mode(mode)
-        return if @drag || @mode == mode
+        return if @mode == mode
+
+        # 锁定状态下允许切换：先结束当前交互
+        if @drag
+          return unless @drag[:sticky]
+
+          cancel_drag(Sketchup.active_model.active_view)
+        end
 
         @mode = mode
         @hover = nil
+        @flash_text = "模式：#{MODE_LABEL[mode]}（#{MODE_HINT[mode]}）"
+        @flash_until = Time.now + FLASH_SECONDS
         update_ui
         Sketchup.active_model.active_view.invalidate
+        schedule_redraw
+      end
+
+      # 提示淡出后重画一次
+      def schedule_redraw
+        view = Sketchup.active_model.active_view
+        UI.start_timer(FLASH_SECONDS, false) do
+          begin
+            view.invalidate
+          rescue StandardError
+            nil
+          end
+        end
+      rescue StandardError
+        nil
       end
 
       def toggle_object_axes
@@ -204,6 +246,10 @@ module Ban
 
       def toggle_explode_curves
         Settings.explode_curves = !Settings.explode_curves?
+      end
+
+      def toggle_snap
+        Settings.snap = !Settings.snap?
       end
 
       # ---- 精确输入（右键）------------------------------------------------
@@ -501,9 +547,8 @@ module Ban
       end
 
       def onKeyDown(key, _repeat, _flags, view)
-        return false unless key == 9 # Tab
-
-        return false if @drag
+        # Tab（9）或 M（77/109）切换 拉伸缩放 / 收分
+        return false unless [9, 77, 109].include?(key)
 
         index = MODE_ORDER.index(@mode) || 0
         set_mode(MODE_ORDER[(index + 1) % MODE_ORDER.size])
@@ -588,9 +633,36 @@ module Ban
 
         draw_box(view)
         draw_axis_lock(view) if @drag
+        draw_input_point(view)
         draw_taper_guide(view) if @mode == :taper
         draw_handles(view)
         draw_hud(view)
+      rescue StandardError
+        nil
+      end
+
+      # 拖动时把拾取点画出来：既画 SketchUp 原生推理点，也画插件自己找到的特征点，
+      # 不然用户看不到"吸到哪儿了"
+      def draw_input_point(view)
+        return unless @drag
+
+        if @snapped && @ip.respond_to?(:draw)
+          begin
+            @ip.draw(view)
+          rescue StandardError
+            nil
+          end
+        end
+
+        return if @snap_point.nil?
+
+        view.line_stipple = ''
+        view.line_width = 2
+        view.drawing_color = COLOR_SNAP
+        view.draw_points([@snap_point], px(9), DRAW_FILLED_SQUARE, COLOR_SNAP)
+        view.draw_points([@snap_point], px(15), DRAW_OPEN_SQUARE, COLOR_SNAP)
+      rescue StandardError
+        nil
       end
 
       # 选择状态下高亮鼠标指向的对象
@@ -606,11 +678,18 @@ module Ban
 
       # 锁定状态下画出方向轴，让"锁轴"看得见
       def draw_axis_lock(view)
+        return if @drag.nil?
+
         handle = @drag[:handle]
         box = @drag[:base_box]
-        direction = box.axes[handle[:axis]]
-        point = @drag[:anchor_point]
-        reach = box.sizes[handle[:axis]] * 0.75 + 2.0
+        handle_axes(handle).each do |axis|
+          draw_axis_line(view, box, axis, @drag[:anchor_point])
+        end
+      end
+
+      def draw_axis_line(view, box, axis, point)
+        direction = box.axes[axis]
+        reach = box.sizes[axis] * 0.75 + 2.0
         first = VecMath.point_plus(point, VecMath.scale(direction, -reach))
         second = VecMath.point_plus(point, VecMath.scale(direction, reach))
 
@@ -619,6 +698,17 @@ module Ban
         view.drawing_color = COLOR_AXIS_LOCK
         view.draw(GL_LINES, [first, second])
         view.line_stipple = ''
+      end
+
+      # 手柄对应的方向轴：面心手柄 1 条，角点手柄 3 条
+      def handle_axes(handle)
+        return [0, 1, 2] if handle[:type] == :corner
+
+        [handle[:axis]]
+      end
+
+      def handle_axis_label(handle)
+        handle_axes(handle).map { |axis| AXIS_LABEL[axis] }.join('/')
       end
 
       # ------------------------------------------------------------ 私有
@@ -909,10 +999,32 @@ module Ban
         end
       end
 
-      # 鼠标位置 -> 世界坐标（优先使用 SketchUp 的推理点，可精确吸附到目标点）
+      # 鼠标位置 -> 世界坐标。
+      #  1) 先看 SketchUp 原生推理点（端点 / 中点 / 圆心 / 交点 …）
+      #  2) 再用插件自己的几何特征点吸附（组/组件的角点、中心、端点、中点、圆心）
+      #  3) 都没有时按鼠标射线投影，保证拖动平滑
       def drag_point(view, x, y)
-        @ip.pick(view, x, y, @ref_ip)
-        return @ip.position if @ip.vertex || @ip.edge || @ip.face
+        @ip.pick(view, x * dpi, y * dpi, @ref_ip)
+        @snap_tooltip = input_point_tooltip
+        @snapped = snapped?
+
+        if Settings.snap?
+          if @snapped
+            @snap_point = @ip.position
+            @snap_kind = snap_label
+            return @snap_point
+          end
+
+          found = feature_snap_point(view, x, y)
+          if found
+            @snap_point = found[0]
+            @snap_kind = found[1]
+            return @snap_point
+          end
+        end
+
+        @snap_point = nil
+        @snap_kind = ''
 
         handle = @drag[:handle]
         base = @drag[:anchor_point]
@@ -921,6 +1033,129 @@ module Ban
         else
           screen_plane_point(view, x, y, base) || @ip.position
         end
+      end
+
+      # ---- 自研吸附（不依赖 SketchUp 推理，保证有可见的拾取点）--------------
+
+      # @return [Array(Geom::Point3d, String), nil]
+      def feature_snap_point(view, x, y)
+        candidates = candidate_features(view, x, y)
+        return nil if candidates.empty?
+
+        best = nil
+        best_distance = SNAP_PX.to_f
+        candidates.each do |point, kind|
+          screen = view.screen_coords(point)
+          next unless screen
+
+          distance = Math.sqrt(
+            (screen.x - x * dpi)**2 + (screen.y - y * dpi)**2
+          )
+          next if distance > best_distance
+
+          best = [point, kind]
+          best_distance = distance
+        end
+        best
+      rescue StandardError
+        nil
+      end
+
+      # 鼠标附近实体的特征点：组/组件取包围盒 8 角点 + 6 面心 + 中心，
+      # 散几何取端点 / 中点 / 圆心 / 面心
+      def candidate_features(view, x, y)
+        return [] unless view.respond_to?(:pick_helper)
+
+        picker = view.pick_helper
+        picker.do_pick(x * dpi, y * dpi, px(SNAP_PX))
+        count = picker.respond_to?(:count) ? picker.count : 0
+
+        list = []
+        count.times do |index|
+          entity = element_at(picker, index)
+          next if entity.nil?
+
+          list.concat(feature_points(entity))
+          break if list.size > 240 # 安全阀
+        end
+        list
+      rescue StandardError
+        []
+      end
+
+      def feature_points(entity)
+        list = []
+        if instance?(entity)
+          bounds = entity.bounds
+          (0..7).each { |index| list << [bounds.corner(index), '角点'] }
+          list << [bounds.center, '中心']
+          (0..5).each do |index|
+            list << [face_center_of_bounds(bounds, index), '面心']
+          end
+        elsif entity.is_a?(Sketchup::Edge)
+          head = entity.start.position
+          tail = entity.end.position
+          list << [head, '端点'] << [tail, '端点']
+          list << [midpoint(head, tail), '中点']
+          curve = entity.curve
+          if curve.is_a?(Sketchup::ArcCurve) && curve.respond_to?(:center)
+            list << [curve.center, '圆心']
+          end
+        elsif entity.is_a?(Sketchup::Face)
+          entity.vertices.each { |vertex| list << [vertex.position, '端点'] }
+          list << [entity.bounds.center, '面心']
+        end
+        list
+      rescue StandardError
+        list
+      end
+
+      # 包围盒的 6 个面中心
+      def face_center_of_bounds(bounds, index)
+        low = bounds.min
+        high = bounds.max
+        center = bounds.center
+        case index
+        when 0 then Geom::Point3d.new(low.x, center.y, center.z)
+        when 1 then Geom::Point3d.new(high.x, center.y, center.z)
+        when 2 then Geom::Point3d.new(center.x, low.y, center.z)
+        when 3 then Geom::Point3d.new(center.x, high.y, center.z)
+        when 4 then Geom::Point3d.new(center.x, center.y, low.z)
+        else Geom::Point3d.new(center.x, center.y, high.z)
+        end
+      end
+
+      def midpoint(first, second)
+        Geom::Point3d.new(
+          (first.x + second.x) * 0.5,
+          (first.y + second.y) * 0.5,
+          (first.z + second.z) * 0.5
+        )
+      end
+
+      # 是否处在推理吸附状态
+      def snapped?
+        return true if @ip.vertex || @ip.edge || @ip.face
+
+        !@snap_tooltip.to_s.strip.empty?
+      end
+
+      def input_point_tooltip
+        return '' unless @ip.respond_to?(:tooltip)
+
+        @ip.tooltip.to_s.strip
+      rescue StandardError
+        ''
+      end
+
+      # 吸附类型的可读名称（显示在提示里）
+      def snap_label
+        return '端点' if @ip.vertex
+        return '边线' if @ip.edge
+        return '表面' if @ip.face
+        return @snap_tooltip unless @snap_tooltip.to_s.empty?
+
+        ''
       end
 
       # 鼠标射线与给定直线的最近点（沿轴拖动更稳定）
@@ -1286,7 +1521,7 @@ module Ban
 
       def update_ui
         if @drag
-          locked = "已锁定框 #{AXIS_LABEL[@drag[:handle][:axis]]} 轴"
+          locked = "已锁定框 #{handle_axis_label(@drag[:handle])} 轴"
           Sketchup.status_text =
             "变形中（#{MODE_LABEL[@mode]}）：#{locked} —— 移动鼠标缩放，再点一下应用；" \
             '右键「精确输入…」可输入增量（正数延长 / 负数缩短）；Esc 取消。'
@@ -1364,7 +1599,13 @@ module Ban
       def draw_box(view)
         view.line_stipple = ''
         view.line_width = (@drag || @hover) ? 2 : 1
-        view.drawing_color = (@drag || @hover) ? COLOR_BOX_ACTIVE : COLOR_BOX
+        view.drawing_color = if @drag || @hover
+                               COLOR_BOX_ACTIVE
+                             elsif @mode == :taper
+                               COLOR_BOX_TAPER
+                             else
+                               COLOR_BOX
+                             end
         view.draw(GL_LINES, box_edges(@box))
       end
 
@@ -1406,10 +1647,11 @@ module Ban
           lines << '请点击要变形的对象（组 / 组件 / 几何体）'
           lines << 'Shift / Ctrl 点击 = 加选；Esc 退出'
         else
-          lines << "模式：#{MODE_LABEL[@mode]}    (Tab 切换)"
+          lines << "模式：#{MODE_LABEL[@mode]}（#{MODE_HINT[@mode]}）    Tab / M 切换"
         end
         if @drag
-          lines << "已锁定：框 #{AXIS_LABEL[@drag[:handle][:axis]]} 轴（移动鼠标缩放，再点一下应用）"
+          lines << "已锁定：框 #{handle_axis_label(@drag[:handle])} 轴（移动鼠标缩放，再点一下应用）"
+          lines << "拾取：#{@snap_kind}" unless @snap_kind.to_s.empty?
         end
         spec = @drag && @drag[:spec]
 
@@ -1434,6 +1676,25 @@ module Ban
             rescue StandardError
               nil
             end
+          end
+        end
+
+        draw_flash(view)
+      end
+
+      # 切换模式时的大字提示（1.8 秒后自动消失）
+      def draw_flash(view)
+        return if @flash_until.nil? || @flash_text.to_s.empty?
+        return if Time.now > @flash_until
+
+        point = Geom::Point3d.new(px(18), px(86), 0)
+        begin
+          view.draw_text(point, @flash_text, { size: px(22) })
+        rescue StandardError
+          begin
+            view.draw_text(point, @flash_text)
+          rescue StandardError
+            nil
           end
         end
       end
