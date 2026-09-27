@@ -27,7 +27,7 @@ module Ban
         return
       end
       if model.selection.empty?
-        UI.messagebox('请先选中要变形的对象（组 / 组件 / 几何体），再执行本命令。')
+        UI.messagebox("请先选中要变形的对象（组 / 组件 / 几何体），\n再点「变形框收分缩放」。")
         return
       end
       model.select_tool(Tool.new)
@@ -36,11 +36,9 @@ module Ban
     unless file_loaded?(__FILE__)
       command = UI::Command.new('变形框收分缩放') { Ban::TaperScale.start_tool }
       command.tooltip = '变形框收分缩放'
-      command.status_bar_text = '对所选对象建立变形框：拉伸缩放 / 收分，可输入精确比例或目标尺寸'
-      command.set_validation_proc do
-        model = Sketchup.active_model
-        model && !model.selection.empty? ? MF_ENABLED : MF_GRAYED
-      end
+      command.status_bar_text = '先选中对象，再点这里建立变形框：拉伸缩放 / 收分，可锁定方向轴并精确输入'
+      # 始终可点：未选中对象时点击会给出提示（比灰掉更容易理解）
+      command.set_validation_proc { MF_ENABLED }
 
       icon_dir = File.join(File.dirname(__FILE__), 'icons')
       small = File.join(icon_dir, 'taper_scale_24.png')
