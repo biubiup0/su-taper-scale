@@ -1,0 +1,6 @@
+.DS_Store
+*.rbz
+!dist/
+*.skp
+*.skb
+backup/
