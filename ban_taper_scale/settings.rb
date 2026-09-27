@@ -35,6 +35,16 @@ module Ban
       def snap=(value)
         Sketchup.write_default(SECTION, 'snap', value ? true : false)
       end
+
+      # 面心拉伸时是否"保持造型"（只拉伸中段，两端特征原样平移/不动）
+      def middle_stretch?
+        value = Sketchup.read_default(SECTION, 'middle_stretch', true)
+        value.nil? ? true : value
+      end
+
+      def middle_stretch=(value)
+        Sketchup.write_default(SECTION, 'middle_stretch', value ? true : false)
+      end
     end
   end
 end
