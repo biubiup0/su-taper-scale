@@ -53,6 +53,26 @@ module Ban
       COLOR_AXIS_LOCK     = Sketchup::Color.new(0, 170, 120)
       COLOR_PREVIEW       = Sketchup::Color.new(0, 200, 255)
       COLOR_SNAP          = Sketchup::Color.new(255, 0, 170)
+      # 左上角按钮：半透明橙色圆角底
+      COLOR_BUTTON_BG     = Sketchup::Color.new(255, 150, 0, 150)
+      COLOR_BUTTON_EDGE   = Sketchup::Color.new(200, 100, 0, 230)
+      COLOR_BUTTON_TEXT   = Sketchup::Color.new(60, 30, 0, 255)
+
+      # 左上角「切换模式」按钮：x, y, 宽, 高（逻辑像素）
+      MODE_BUTTON = [16, 18, 116, 34].freeze
+      BUTTON_RADIUS = 8
+      BUTTON_FONT = 14
+      # 按钮文字锚点（绝对值，相对按钮左上角）
+      #
+      # draw_text 的锚点 = 文字左上角，所以要让文字在按钮里精确居中：
+      #   汉字字身近似正方形，所以 4 个字的宽度 = 4 × 字号 = 4 × 14 = 56
+      #   x = (按钮宽 - 文字宽) / 2 = (116 - 56) / 2 = 30
+      #   y = (按钮高 - 字号)   / 2 = (34 - 14)  / 2 = 10
+      BUTTON_TEXT_OFFSET = [30, 10].freeze
+      # 估宽用：汉字按 1.0 × 字号，西文/数字按 0.55 × 字号
+      BUTTON_TEXT = '切换模式'
+      # 左上角文字（模式 / 变形框 / 变形量…）起始位置，与按钮留出间隔
+      HUD_TOP = 74
 
       AXIS_LABEL = ['X', 'Y', 'Z'].freeze
 
@@ -198,6 +218,13 @@ module Ban
         id = menu.add_item('拖动时吸附到几何（端点/中点/圆心）') { toggle_snap }
         menu.set_validation_proc(id) { Settings.snap? ? MF_CHECKED : MF_ENABLED }
 
+        # 面心拉伸的两种行为（二选一）
+        id = menu.add_item('面心拉伸：保持造型（只拉伸中段）') { set_middle_stretch(true) }
+        menu.set_validation_proc(id) { Settings.middle_stretch? ? MF_CHECKED : MF_ENABLED }
+
+        id = menu.add_item('面心拉伸：整体缩放（旧行为）') { set_middle_stretch(false) }
+        menu.set_validation_proc(id) { Settings.middle_stretch? ? MF_ENABLED : MF_CHECKED }
+
         menu.add_separator
         menu.add_item('退出工具') { Sketchup.active_model.select_tool(nil) }
         true
@@ -250,6 +277,14 @@ module Ban
 
       def toggle_snap
         Settings.snap = !Settings.snap?
+      end
+
+      def toggle_middle_stretch
+        Settings.middle_stretch = !Settings.middle_stretch?
+      end
+
+      def set_middle_stretch(value)
+        Settings.middle_stretch = value
       end
 
       # ---- 精确输入（右键）------------------------------------------------
@@ -434,6 +469,14 @@ module Ban
           return
         end
 
+        # 左上角「切换模式」按钮
+        if @state == STATE_EDIT && mode_button_hit?(x, y)
+          index = MODE_ORDER.index(@mode) || 0
+          set_mode(MODE_ORDER[(index + 1) % MODE_ORDER.size])
+          view.invalidate
+          return
+        end
+
         model = Sketchup.active_model
         if @state == STATE_SELECT
           handle_selection_click(model, view, x, y, flags)
@@ -525,6 +568,10 @@ module Ban
           if drag[:vertex_set].size > VERTEX_PREVIEW_LIMIT
             @message = '顶点数量较多，实时预览可能会略卡'
           end
+        elsif Settings.middle_stretch? && handle[:type] == :face
+          # 面心拉伸：只拉伸中段，两端造型原样保留
+          drag[:vertex_set] = collect_vertices
+          drag[:cut] = middle_cut_position(drag[:vertex_set], handle, @box)
         end
 
         @drag = drag
@@ -544,16 +591,6 @@ module Ban
           update_ui
           view.invalidate
         end
-      end
-
-      def onKeyDown(key, _repeat, _flags, view)
-        # Tab（9）或 M（77/109）切换 拉伸缩放 / 收分
-        return false unless [9, 77, 109].include?(key)
-
-        index = MODE_ORDER.index(@mode) || 0
-        set_mode(MODE_ORDER[(index + 1) % MODE_ORDER.size])
-        view.invalidate
-        true
       end
 
       # reason: 0 = Esc，1 = 工具被重新激活，2 = 撤销/重做
@@ -1247,6 +1284,11 @@ module Ban
       def apply_spec(spec)
         drag = @drag
         if spec[:kind] == :stretch
+          if drag[:cut] && drag[:vertex_set]
+            apply_middle_stretch(spec)
+            return
+          end
+
           new_box = DeformMath.stretch_box(drag[:base_box], spec[:anchors], spec[:sizes])
           world = stretch_transformation(drag[:base_box], new_box)
           local = @edit_tr.inverse * world * @edit_tr
@@ -1264,6 +1306,65 @@ module Ban
             DeformMath.taper_point(box, axis, anchor, factors, world)
           end
         end
+      end
+
+      # 中段拉伸：固定端那侧不动，超切分面的一侧整体平移
+      def apply_middle_stretch(spec)
+        drag = @drag
+        handle = drag[:handle]
+        box = drag[:base_box]
+        axis = handle[:axis]
+        anchor = 1 - handle[:side]
+        delta = spec[:sizes][axis] - box.sizes[axis]
+        return if delta.abs < 1.0e-9
+
+        cut = drag[:cut]
+        vertex_set = drag[:vertex_set]
+        vertex_set.apply do |world|
+          middle_stretch_point(box, axis, anchor, cut, delta, world)
+        end
+      end
+
+      # ta = 距固定端的归一化距离；ta <= cut 的部分不动，其余整体平移 delta
+      def middle_stretch_point(box, axis, anchor_side, cut, delta, point)
+        t = box.normalize(point)[axis]
+        ta = anchor_side.to_i.zero? ? t : (1.0 - t)
+        return point if ta <= cut
+
+        distance = anchor_side.to_i.zero? ? delta : -delta
+        VecMath.point_plus(point, VecMath.scale(box.axes[axis], distance))
+      end
+
+      # 在"不切断任何特征"的位置找切分面：取相邻顶点之间最大的空档中点，
+      # 并限制在 15% ~ 85% 之间，避免贴到两端
+      def middle_cut_position(vertex_set, handle, box)
+        return 0.5 if vertex_set.nil? || vertex_set.size.zero?
+
+        axis = handle[:axis]
+        anchor = (1 - handle[:side]).to_i
+        values = vertex_set.original_positions.map do |point|
+          t = box.normalize(point)[axis]
+          anchor.zero? ? t : (1.0 - t)
+        end
+        values.sort!
+
+        best_gap = 0.0
+        best_cut = 0.5
+        previous = nil
+        values.each do |value|
+          if previous
+            gap = value - previous
+            middle = (value + previous) * 0.5
+            if gap > best_gap && middle >= 0.15 && middle <= 0.85
+              best_gap = gap
+              best_cut = middle
+            end
+          end
+          previous = value
+        end
+        best_cut
+      rescue StandardError
+        0.5
       end
 
       def stretch_transformation(base, new_box)
@@ -1535,7 +1636,7 @@ module Ban
         else
           Sketchup.status_text =
             "变形框收分缩放（#{MODE_LABEL[@mode]}）：点一下手柄锁定方向轴 → 移动鼠标缩放 → 再点一下应用；" \
-            '也可直接按住拖动；右键「精确输入…」输入增量；Tab 切换 拉伸/收分；' \
+            '也可直接按住拖动；右键「精确输入…」输入增量；点左上角「切换模式」按钮切换 拉伸/收分；' \
             'Ctrl(Windows)/Option(Mac) 点手柄 = 变形副本；Esc 退出。' +
             (@message.empty? ? '' : "  [#{@message}]")
           set_vcb('变形框', @box ? format_sizes(@box.sizes) : '')
@@ -1647,11 +1748,15 @@ module Ban
           lines << '请点击要变形的对象（组 / 组件 / 几何体）'
           lines << 'Shift / Ctrl 点击 = 加选；Esc 退出'
         else
-          lines << "模式：#{MODE_LABEL[@mode]}（#{MODE_HINT[@mode]}）    Tab / M 切换"
+          draw_mode_button(view)
+          lines << "模式：#{MODE_LABEL[@mode]}（#{MODE_HINT[@mode]}）"
         end
         if @drag
           lines << "已锁定：框 #{handle_axis_label(@drag[:handle])} 轴（移动鼠标缩放，再点一下应用）"
           lines << "拾取：#{@snap_kind}" unless @snap_kind.to_s.empty?
+          if @drag[:cut]
+            lines << format('保持造型：只拉伸中段（切分在 %.0f%% 处）', @drag[:cut] * 100)
+          end
         end
         spec = @drag && @drag[:spec]
 
@@ -1667,7 +1772,7 @@ module Ban
         lines << @message unless @message.empty?
 
         lines.each_with_index do |text, index|
-          point = Geom::Point3d.new(px(18), px(26 + 17 * index), 0)
+          point = Geom::Point3d.new(px(18), px(HUD_TOP + 17 * index), 0)
           begin
             view.draw_text(point, text, { size: px(13) })
           rescue StandardError
@@ -1679,15 +1784,16 @@ module Ban
           end
         end
 
-        draw_flash(view)
+        # 大字提示放在 HUD 文字下面，避免互相压住
+        draw_flash(view, HUD_TOP + 17 * lines.size + 16)
       end
 
       # 切换模式时的大字提示（1.8 秒后自动消失）
-      def draw_flash(view)
+      def draw_flash(view, top)
         return if @flash_until.nil? || @flash_text.to_s.empty?
         return if Time.now > @flash_until
 
-        point = Geom::Point3d.new(px(18), px(86), 0)
+        point = Geom::Point3d.new(px(18), px(top + 20), 0)
         begin
           view.draw_text(point, @flash_text, { size: px(22) })
         rescue StandardError
@@ -1697,6 +1803,81 @@ module Ban
             nil
           end
         end
+      end
+
+      # ---- 左上角「切换模式」按钮 ------------------------------------------
+
+      def mode_button_rect
+        x, y, width, height = MODE_BUTTON
+        [x, y, x + width, y + height]
+      end
+
+      def mode_button_hit?(x, y)
+        left, top, right, bottom = mode_button_rect
+        x >= left && x <= right && y >= top && y <= bottom
+      end
+
+      def draw_mode_button(view)
+        left, top, right, bottom = mode_button_rect
+        corners = rounded_rect_points(left, top, right, bottom, BUTTON_RADIUS)
+
+        view.line_stipple = ''
+        view.line_width = 1
+        begin
+          view.drawing_color = COLOR_BUTTON_BG
+          view.draw2d(GL_POLYGON, corners)
+        rescue StandardError
+          begin
+            view.draw2d(GL_QUADS, corners)
+          rescue StandardError
+            nil
+          end
+        end
+        begin
+          view.drawing_color = COLOR_BUTTON_EDGE
+          view.draw2d(GL_LINE_LOOP, corners)
+        rescue StandardError
+          nil
+        end
+
+        text = BUTTON_TEXT
+        # 锚点 = 文字左上角，按绝对值精确居中
+        label = Geom::Point3d.new(px(left + BUTTON_TEXT_OFFSET[0]),
+                                  px(top + BUTTON_TEXT_OFFSET[1]), 0)
+        begin
+          view.draw_text(label, text,
+                         { size: px(BUTTON_FONT), color: COLOR_BUTTON_TEXT })
+        rescue StandardError
+          begin
+            view.draw_text(label, text)
+          rescue StandardError
+            nil
+          end
+        end
+      rescue StandardError
+        nil
+      end
+
+      # 圆角矩形轮廓点（屏幕坐标，用于 draw2d）
+      def rounded_rect_points(left, top, right, bottom, radius, segments = 5)
+        points = []
+        arcs = [
+          [right - radius, top + radius, -Math::PI / 2, 0],
+          [right - radius, bottom - radius, 0, Math::PI / 2],
+          [left + radius, bottom - radius, Math::PI / 2, Math::PI],
+          [left + radius, top + radius, Math::PI, Math::PI * 1.5]
+        ]
+        arcs.each do |center_x, center_y, start_angle, end_angle|
+          (0..segments).each do |index|
+            angle = start_angle + (end_angle - start_angle) * index / segments
+            points << Geom::Point3d.new(
+              px(center_x + Math.cos(angle) * radius),
+              px(center_y + Math.sin(angle) * radius),
+              0
+            )
+          end
+        end
+        points
       end
 
       def end_face_sizes(spec)
