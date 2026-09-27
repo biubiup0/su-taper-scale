@@ -26,6 +26,10 @@ module Ban
       MODE_ORDER = [:stretch, :taper].freeze
       MODE_LABEL = { stretch: '拉伸缩放', taper: '收分' }.freeze
 
+      # 工具状态：等待选择对象 / 已有变形框
+      STATE_SELECT = :select
+      STATE_EDIT   = :edit
+
       DRAW_OPEN_SQUARE     = 1
       DRAW_FILLED_SQUARE   = 2
       DRAW_FILLED_TRIANGLE = 7
@@ -39,6 +43,7 @@ module Ban
       COLOR_DRAG          = Sketchup::Color.new(255, 45, 0)
       COLOR_TEXT          = Sketchup::Color.new(50, 50, 50)
       COLOR_AXIS_LOCK     = Sketchup::Color.new(0, 170, 120)
+      COLOR_PREVIEW       = Sketchup::Color.new(0, 200, 255)
 
       AXIS_LABEL = ['X', 'Y', 'Z'].freeze
 
@@ -62,9 +67,13 @@ module Ban
       end
 
       COPY_MASK = Tool.modifier_mask(:COPY_MODIFIER_MASK)
+      CONSTRAIN_MASK = Tool.modifier_mask(:CONSTRAIN_MODIFIER_MASK)
+      # Shift 或 Ctrl/Option 点击 = 加选
+      ADD_MASK = COPY_MASK | CONSTRAIN_MASK
 
       def initialize
         @mode = :stretch
+        @state = STATE_EDIT
         @box = nil
         @targets = []
         @parent_entities = nil
@@ -75,40 +84,65 @@ module Ban
         @ref_ip = Sketchup::InputPoint.new
         @dpi = nil
         @message = ''
+        @preview_entity = nil
       end
 
       # ------------------------------------------------------------ 生命周期
 
       def activate
         model = Sketchup.active_model
-        refresh_context(model)
-        if @targets.empty?
-          UI.messagebox('请先选中要变形的对象（组 / 组件 / 几何体），再启用本工具。')
-          UI.start_timer(0.0, false) { model.select_tool(nil) }
+        if model.nil?
+          UI.messagebox('当前没有打开模型。')
           return
         end
-        @box = build_box
-        @hover = nil
+
         @drag = nil
+        @hover = nil
         @message = ''
+        refresh_context(model)
+        if @targets.empty?
+          # 先点命令、再选对象
+          enter_select_state(model)
+        else
+          @state = STATE_EDIT
+          @box = build_box
+        end
         update_ui
         model.active_view.invalidate
       end
 
       def deactivate(view)
         cancel_drag(view) if @drag
+        @preview_entity = nil
         set_vcb('', '')
         Sketchup.status_text = ''
         view.invalidate if view
       end
 
       def resume(view)
-        refresh_context(Sketchup.active_model)
-        @box = @targets.empty? ? nil : build_box
+        model = Sketchup.active_model
+        refresh_context(model)
         @drag = nil
         @hover = nil
+        if @targets.empty?
+          enter_select_state(model)
+        else
+          @state = STATE_EDIT
+          @box = build_box
+        end
         update_ui
         view.invalidate
+      end
+
+      # 进入"等待选择对象"状态
+      def enter_select_state(model)
+        @state = STATE_SELECT
+        @box = nil
+        @hover = nil
+        @preview_entity = nil
+        @message = ''
+        model.selection.clear
+        refresh_context(model)
       end
 
       def suspend(_view)
@@ -331,6 +365,12 @@ module Ban
       def onMouseMove(_flags, x, y, view)
         if @drag
           update_drag(x, y, view)
+        elsif @state == STATE_SELECT
+          entity = pick_entity(view, x, y)
+          return if same_entity?(entity, @preview_entity)
+
+          @preview_entity = entity
+          view.invalidate
         else
           handle = pick_handle(view, x, y)
           return if same_handle?(handle, @hover)
@@ -348,10 +388,21 @@ module Ban
           return
         end
 
-        handle = pick_handle(view, x, y)
-        return unless handle
-
         model = Sketchup.active_model
+        if @state == STATE_SELECT
+          handle_selection_click(model, view, x, y, flags)
+          return
+        end
+
+        handle = pick_handle(view, x, y)
+        unless handle
+          # 点空白处：回到"重新选择对象"
+          enter_select_state(model)
+          update_ui
+          view.invalidate
+          return
+        end
+
         model.start_operation(OP_NAME, false)
 
         copy = (flags & COPY_MASK) != 0
@@ -366,6 +417,44 @@ module Ban
         return cancel_click(model, view) unless handle
 
         start_drag(handle, copy, x, y)
+        update_ui
+        view.invalidate
+      end
+
+      # 选择状态下的点击：选中点击到的对象，然后建立变形框
+      def handle_selection_click(model, view, x, y, flags)
+        add = (flags & ADD_MASK) != 0
+        entity = pick_entity(view, x, y)
+
+        if entity.nil?
+          model.selection.clear unless add
+          refresh_context(model)
+          @message = '没点到对象，请点击组 / 组件 / 几何体'
+          update_ui
+          view.invalidate
+          return
+        end
+
+        selected = model.selection.to_a
+        if add && selected.include?(entity)
+          model.selection.remove(entity)
+        else
+          model.selection.clear unless add
+          model.selection.add(entity)
+        end
+
+        refresh_context(model)
+        if @targets.empty?
+          @state = STATE_SELECT
+          @box = nil
+          @preview_entity = entity
+          @message = '继续点击可加选（Shift / Ctrl）；至少要选中一个对象'
+        else
+          @state = STATE_EDIT
+          @box = build_box
+          @preview_entity = nil
+          @message = ''
+        end
         update_ui
         view.invalidate
       end
@@ -466,6 +555,14 @@ module Ban
       def getExtents
         bounds = Geom::BoundingBox.new
         bounds.add(@box.corners) if @box
+        if @preview_entity
+          begin
+            preview = @preview_entity.bounds
+            bounds.add((0..7).map { |index| preview.corner(index) })
+          rescue StandardError
+            nil
+          end
+        end
         @targets.each do |entity|
           begin
             next unless entity.valid?
@@ -481,6 +578,12 @@ module Ban
       end
 
       def draw(view)
+        if @state == STATE_SELECT
+          draw_preview(view)
+          draw_hud(view)
+          return
+        end
+
         return if @box.nil?
 
         draw_box(view)
@@ -488,6 +591,17 @@ module Ban
         draw_taper_guide(view) if @mode == :taper
         draw_handles(view)
         draw_hud(view)
+      end
+
+      # 选择状态下高亮鼠标指向的对象
+      def draw_preview(view)
+        box = @preview_entity ? box_for(@preview_entity) : nil
+        return if box.nil?
+
+        view.line_stipple = ''
+        view.line_width = 2
+        view.drawing_color = COLOR_PREVIEW
+        view.draw(GL_LINES, box_edges(box))
       end
 
       # 锁定状态下画出方向轴，让"锁轴"看得见
@@ -605,6 +719,72 @@ module Ban
       end
 
       # ---- 手柄 ---------------------------------------------------------
+
+      # ---- 拾取对象（选择状态）--------------------------------------------
+
+      def same_entity?(first, second)
+        return true if first.nil? && second.nil?
+        return false if first.nil? || second.nil?
+
+        first == second
+      end
+
+      # 拾取鼠标下的对象：只取"当前上下文"里的那一层（优先组/组件）
+      def pick_entity(view, x, y)
+        return nil unless view.respond_to?(:pick_helper)
+
+        model = Sketchup.active_model
+        active = model.active_entities
+        picker = view.pick_helper
+        picker.do_pick(x * dpi, y * dpi)
+        count = picker.count
+
+        count.times do |index|
+          entity = element_at(picker, index)
+          next unless instance?(entity)
+
+          return entity if in_active_context?(entity, active)
+        end
+
+        count.times do |index|
+          entity = element_at(picker, index)
+          next if entity.nil? || instance?(entity)
+
+          return entity if in_active_context?(entity, active)
+        end
+
+        picker.respond_to?(:best_picked) ? picker.best_picked : nil
+      rescue StandardError
+        nil
+      end
+
+      def element_at(picker, index)
+        return nil unless picker.respond_to?(:element_at)
+
+        picker.element_at(index)
+      rescue StandardError
+        nil
+      end
+
+      def in_active_context?(entity, active_entities)
+        return true if entity.nil?
+
+        entity.parent == active_entities
+      rescue StandardError
+        true
+      end
+
+      # 单个对象的变形框（预览用）
+      def box_for(entity)
+        if instance?(entity) && Settings.object_axes?
+          instance_box(entity)
+        else
+          bounds = entity.bounds
+          DeformBox.from_points([bounds.min, bounds.max])
+        end
+      rescue StandardError
+        nil
+      end
 
       def handles
         return [] if @box.nil?
@@ -1111,6 +1291,12 @@ module Ban
             "变形中（#{MODE_LABEL[@mode]}）：#{locked} —— 移动鼠标缩放，再点一下应用；" \
             '右键「精确输入…」可输入增量（正数延长 / 负数缩短）；Esc 取消。'
           set_vcb(vcb_label, vcb_value)
+        elsif @state == STATE_SELECT
+          Sketchup.status_text =
+            '变形框收分缩放：请点击要变形的对象（组 / 组件 / 几何体）；' \
+            'Shift 或 Ctrl(Windows)/Option(Mac) 点击可加选；Esc 退出。' +
+            (@message.empty? ? '' : "  [#{@message}]")
+          set_vcb('', '')
         else
           Sketchup.status_text =
             "变形框收分缩放（#{MODE_LABEL[@mode]}）：点一下手柄锁定方向轴 → 移动鼠标缩放 → 再点一下应用；" \
@@ -1215,7 +1401,13 @@ module Ban
       end
 
       def draw_hud(view)
-        lines = ["模式：#{MODE_LABEL[@mode]}    (Tab 切换)"]
+        lines = []
+        if @state == STATE_SELECT
+          lines << '请点击要变形的对象（组 / 组件 / 几何体）'
+          lines << 'Shift / Ctrl 点击 = 加选；Esc 退出'
+        else
+          lines << "模式：#{MODE_LABEL[@mode]}    (Tab 切换)"
+        end
         if @drag
           lines << "已锁定：框 #{AXIS_LABEL[@drag[:handle][:axis]]} 轴（移动鼠标缩放，再点一下应用）"
         end
