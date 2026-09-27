@@ -49,7 +49,6 @@ module Ban
       COLOR_CORNER_HANDLE = Sketchup::Color.new(255, 255, 255)
       COLOR_HOT           = Sketchup::Color.new(255, 140, 0)
       COLOR_DRAG          = Sketchup::Color.new(255, 45, 0)
-      COLOR_TEXT          = Sketchup::Color.new(50, 50, 50)
       COLOR_AXIS_LOCK     = Sketchup::Color.new(0, 170, 120)
       COLOR_PREVIEW       = Sketchup::Color.new(0, 200, 255)
       COLOR_SNAP          = Sketchup::Color.new(255, 0, 170)
@@ -69,7 +68,6 @@ module Ban
       #   x = (按钮宽 - 文字宽) / 2 = (116 - 56) / 2 = 30
       #   y = (按钮高 - 字号)   / 2 = (34 - 14)  / 2 = 10
       BUTTON_TEXT_OFFSET = [30, 10].freeze
-      # 估宽用：汉字按 1.0 × 字号，西文/数字按 0.55 × 字号
       BUTTON_TEXT = '切换模式'
       # 左上角文字（模式 / 变形框 / 变形量…）起始位置，与按钮留出间隔
       HUD_TOP = 74
@@ -277,10 +275,6 @@ module Ban
 
       def toggle_snap
         Settings.snap = !Settings.snap?
-      end
-
-      def toggle_middle_stretch
-        Settings.middle_stretch = !Settings.middle_stretch?
       end
 
       def set_middle_stretch(value)
