@@ -19,7 +19,9 @@ module Ban
 
       def initialize
         @entries = []
+        @edge_entries = []
         @seen = {}
+        @seen_edges = {}
       end
 
       def size
@@ -34,6 +36,17 @@ module Ban
       # 收集时记录的原始世界坐标
       def original_positions
         @entries.map { |entry| entry.world }
+      end
+
+      # 收集时记录的边（世界坐标端点对）。
+      # 用来判断某个切分面是不是"平直"的：跨过它的边必须都平行于拖动轴。
+      def original_edges
+        @edge_entries.map do |edge, transformation|
+          [
+            edge.start.position.transform(transformation),
+            edge.end.position.transform(transformation)
+          ]
+        end
       end
 
       # targets      活动上下文中的实体数组
@@ -81,7 +94,10 @@ module Ban
 
           walk_entities(child_ents, transformation * entity.transformation,
                         unique, explode, depth)
-        elsif entity.is_a?(Sketchup::Edge) || entity.is_a?(Sketchup::Face)
+        elsif entity.is_a?(Sketchup::Edge)
+          add_edge(entity, transformation)
+          entity.vertices.each { |vertex| add(vertex, parent_ents, transformation) }
+        elsif entity.is_a?(Sketchup::Face)
           entity.vertices.each { |vertex| add(vertex, parent_ents, transformation) }
         elsif entity.is_a?(Sketchup::Vertex)
           add(entity, parent_ents, transformation)
@@ -100,6 +116,7 @@ module Ban
         end
 
         entities.grep(Sketchup::Edge).each do |edge|
+          add_edge(edge, transformation)
           edge.vertices.each { |vertex| add(vertex, entities, transformation) }
         end
 
@@ -117,6 +134,16 @@ module Ban
         @seen[vertex.entityID] = true
         world = vertex.position.transform(transformation)
         @entries << Entry.new(entities, vertex, world, transformation.inverse)
+      end
+
+      def add_edge(edge, transformation)
+        id = edge.entityID
+        return if @seen_edges.key?(id)
+
+        @seen_edges[id] = true
+        @edge_entries << [edge, transformation]
+      rescue StandardError
+        nil
       end
 
       def instance?(entity)

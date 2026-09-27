@@ -8,7 +8,7 @@ require 'extensions.rb'
 module Ban
   module TaperScale
     EXTENSION_NAME    = '变形框收分缩放'.freeze
-    EXTENSION_VERSION = '1.2.7'.freeze
+    EXTENSION_VERSION = '1.4.1'.freeze
     EXTENSION_ID      = 'ban_taper_scale'.freeze
 
     unless file_loaded?(__FILE__)

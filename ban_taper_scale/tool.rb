@@ -32,6 +32,20 @@ module Ban
         taper: '只有面心手柄（沿轴收分）'
       }.freeze
       FLASH_SECONDS = 1.8
+      # 「保持造型」的切分面（拉伸区）默认放在物体中部这一段。
+      MID_BAND_LO = 0.48
+      MID_BAND_HI = 0.52
+      # 切分面必须落在"干净空档"里：空档至少要占全长的 20%。
+      # 顶点密集（连续曲面 / 带锥度的曲面）时找不到这种空档，
+      # 硬切会把一排面从中间劈开造成折痕，所以此时退回整体缩放。
+      MIN_CLEAN_GAP_RATIO = 0.20
+      # 切分面不能贴着顶点，按空档宽度留出余量（另有 2% 上限）
+      CUT_INSET_RATIO = 0.25
+      MAX_CUT_INSET = 0.02
+      # 判断"边是否平行于拖动轴"的容差（cos 约 2.6°）
+      PARALLEL_COS = 0.999
+      # SketchUp 内置指针 ID：0 = 系统默认箭头
+      DEFAULT_CURSOR_ID = 0
 
       # 工具状态：等待选择对象 / 已有变形框
       STATE_SELECT = :select
@@ -52,10 +66,19 @@ module Ban
       COLOR_AXIS_LOCK     = Sketchup::Color.new(0, 170, 120)
       COLOR_PREVIEW       = Sketchup::Color.new(0, 200, 255)
       COLOR_SNAP          = Sketchup::Color.new(255, 0, 170)
+      COLOR_ZONE          = Sketchup::Color.new(255, 120, 0)
+      COLOR_ZONE_FILL     = Sketchup::Color.new(255, 140, 0, 48)
+      COLOR_ZONE_WARN     = Sketchup::Color.new(230, 40, 40)
       # 左上角按钮：半透明橙色圆角底
       COLOR_BUTTON_BG     = Sketchup::Color.new(255, 150, 0, 150)
       COLOR_BUTTON_EDGE   = Sketchup::Color.new(200, 100, 0, 230)
       COLOR_BUTTON_TEXT   = Sketchup::Color.new(60, 30, 0, 255)
+      # 收分模式下的按钮（紫色，和变形框同色，避免误以为还在拉伸缩放）
+      COLOR_BUTTON_BG_TAPER   = Sketchup::Color.new(150, 90, 220, 150)
+      COLOR_BUTTON_EDGE_TAPER = Sketchup::Color.new(100, 50, 170, 230)
+      MODE_BADGE_STRETCH = Sketchup::Color.new(200, 110, 0, 255)
+      MODE_BADGE_TAPER   = Sketchup::Color.new(120, 60, 200, 255)
+      MODE_BADGE_FONT    = 15
 
       # 左上角「切换模式」按钮：x, y, 宽, 高（逻辑像素）
       MODE_BUTTON = [16, 18, 116, 34].freeze
@@ -109,6 +132,7 @@ module Ban
         @hover = nil
         @ip = Sketchup::InputPoint.new
         @ref_ip = Sketchup::InputPoint.new
+        @zone_axis_hint = nil
         @dpi = nil
         @message = ''
         @preview_entity = nil
@@ -129,6 +153,7 @@ module Ban
           return
         end
 
+        reset_cursor
         @drag = nil
         @hover = nil
         @message = ''
@@ -140,8 +165,12 @@ module Ban
           @state = STATE_EDIT
           @box = build_box
         end
+        # 启动时提示当前模式（避免不知道现在处于哪种模式）
+        @flash_text = "模式：#{MODE_LABEL[@mode]}（#{MODE_HINT[@mode]}）"
+        @flash_until = Time.now + FLASH_SECONDS
         update_ui
         model.active_view.invalidate
+        schedule_redraw
       end
 
       def deactivate(view)
@@ -154,6 +183,9 @@ module Ban
 
       def resume(view)
         model = Sketchup.active_model
+        # 中键旋转（Orbit）会把工具 suspend 掉，回来时 SketchUp 有时把"旋转"
+        # 的指针留在原地，这里显式设回默认箭头。
+        reset_cursor
         refresh_context(model)
         @drag = nil
         @hover = nil
@@ -180,6 +212,19 @@ module Ban
 
       def suspend(_view)
         nil
+      end
+
+      # 显式把鼠标指针设回默认箭头（0 = 内置箭头指针）
+      def reset_cursor
+        UI.set_cursor(DEFAULT_CURSOR_ID)
+      rescue StandardError
+        false
+      end
+
+      # SketchUp 询问"这个工具用什么指针"时调用：设回箭头并告诉它不用再改，
+      # 否则旋转视图后指针会一直停在"旋转"图标上。
+      def onSetCursor
+        reset_cursor ? true : false
       end
 
       def enableVCB?
@@ -222,6 +267,12 @@ module Ban
 
         id = menu.add_item('面心拉伸：整体缩放（旧行为）') { set_middle_stretch(false) }
         menu.set_validation_proc(id) { Settings.middle_stretch? ? MF_ENABLED : MF_CHECKED }
+
+        id = menu.add_item('面心拉伸：拉伸区域设置…（1~2 个区域）') { edit_stretch_zones }
+        menu.set_validation_proc(id) { Settings.stretch_zones.empty? ? MF_ENABLED : MF_CHECKED }
+
+        id = menu.add_item('面心拉伸：拉伸区域＝自动（物体中部）') { set_stretch_zones('', false) }
+        menu.set_validation_proc(id) { Settings.stretch_zones.empty? ? MF_CHECKED : MF_ENABLED }
 
         menu.add_separator
         menu.add_item('退出工具') { Sketchup.active_model.select_tool(nil) }
@@ -279,6 +330,52 @@ module Ban
 
       def set_middle_stretch(value)
         Settings.middle_stretch = value
+      end
+
+      # 右键「拉伸区域设置…」：填 1~2 个区间，留空 = 自动取物体中部
+      def edit_stretch_zones
+        current = Settings.stretch_zones
+        defaults = [
+          current[0] ? Settings.format_zones([current[0]]) : '',
+          current[1] ? Settings.format_zones([current[1]]) : ''
+        ]
+        captures = [
+          '拉伸区 1（%，留空＝自动取物体中部，例如 30-40）',
+          '拉伸区 2（%，可留空；与区域 1 互不相连，例如 60-70）'
+        ]
+        results = UI.inputbox(captures, defaults,
+                              '拉伸区域设置（0% = 变形框起点，100% = 另一端）')
+        return if results.nil? || results == false
+
+        text = results.map { |value| value.to_s.strip }.reject(&:empty?).join(',')
+        if text.empty?
+          Settings.stretch_zones_text = ''
+        else
+          zones = Settings.parse_zones(text)
+          if zones.nil?
+            UI.messagebox("拉伸区填得不对：#{text}\n\n" \
+                          "写法：30-40 或 30%~40%；两个区用逗号隔开，例如 30-40,60-70\n" \
+                          '取值范围 0%~100%，最多 2 个区间。')
+          else
+            Settings.stretch_zones_text = Settings.format_zones(zones)
+            # 设了拉伸区就是想"保持造型"，顺手把模式切回来，免得用户纳闷为什么没反应
+            Settings.middle_stretch = true
+          end
+        end
+        update_ui
+        Sketchup.active_model.active_view.invalidate
+      rescue StandardError => error
+        UI.messagebox("拉伸区域设置失败：#{error.message}")
+      end
+
+      # 直接写入区间文本（空字符串 = 自动）；notify 为 true 时弹一句确认
+      def set_stretch_zones(text, notify = true)
+        Settings.stretch_zones_text = text
+        update_ui
+        Sketchup.active_model.active_view.invalidate
+        UI.messagebox('拉伸区已设为：自动（物体中部）') if notify
+      rescue StandardError
+        nil
       end
 
       # ---- 精确输入（右键）------------------------------------------------
@@ -451,6 +548,7 @@ module Ban
           return if same_handle?(handle, @hover)
 
           @hover = handle
+          @zone_axis_hint = handle[:axis] if handle && handle[:type] == :face
           update_ui
           view.invalidate
         end
@@ -543,6 +641,7 @@ module Ban
       end
 
       def start_drag(handle, copy, x, y)
+        @zone_axis_hint = handle[:axis] if handle[:type] == :face
         drag = {
           handle: handle,
           mode: @mode,
@@ -565,7 +664,17 @@ module Ban
         elsif Settings.middle_stretch? && handle[:type] == :face
           # 面心拉伸：只拉伸中段，两端造型原样保留
           drag[:vertex_set] = collect_vertices
-          drag[:cut] = middle_cut_position(drag[:vertex_set], handle, @box)
+          zones = Settings.stretch_zones
+          if zones.empty?
+            drag[:cut] = middle_cut_position(drag[:vertex_set], handle, @box)
+          else
+            drag[:zones] = zones
+            # 平直与否在这里算一次，绘制时直接用（免得每帧扫全模型的边）
+            edges = drag[:vertex_set].original_edges
+            drag[:zones_clean] = zones.map do |low, high|
+              zone_straight?(@box, handle[:axis], low, high, edges)
+            end
+          end
         end
 
         @drag = drag
@@ -663,7 +772,10 @@ module Ban
         return if @box.nil?
 
         draw_box(view)
+        draw_mode_badge(view)
         draw_axis_lock(view) if @drag
+        draw_cut_plane(view)
+        draw_zones(view)
         draw_input_point(view)
         draw_taper_guide(view) if @mode == :taper
         draw_handles(view)
@@ -736,6 +848,173 @@ module Ban
         return [0, 1, 2] if handle[:type] == :corner
 
         [handle[:axis]]
+      end
+
+      # 画出"拉伸区"：跨切分面的那一圈框线。
+      # 这一段就是被拉长（或被压短）的地方，别的部分整体平移。
+      def draw_cut_plane(view)
+        return if @drag.nil?
+
+        cut = @drag[:cut]
+        return if cut.nil?
+
+        handle = @drag[:handle]
+        box = @drag[:base_box]
+        axis = handle[:axis]
+        anchor = (1 - handle[:side]).to_i
+        fraction = anchor.zero? ? cut : (1.0 - cut)
+        others = (0...3).reject { |index| index == axis }
+        corners = [[0, 0], [0, 1], [1, 1], [1, 0]].map do |first, second|
+          fractions = [0.0, 0.0, 0.0]
+          fractions[axis] = fraction
+          fractions[others[0]] = first.to_f
+          fractions[others[1]] = second.to_f
+          box_fraction_point(box, fractions)
+        end
+
+        view.line_stipple = '-'
+        view.line_width = 2
+        view.drawing_color = COLOR_HOT
+        view.draw(GL_LINE_LOOP, corners)
+        view.line_stipple = ''
+      rescue StandardError
+        nil
+      end
+
+      def box_fraction_point(box, fractions)
+        point = box.origin
+        3.times do |index|
+          point = VecMath.point_plus(
+            point, VecMath.scale(box.axes[index], box.sizes[index] * fractions[index])
+          )
+        end
+        point
+      end
+
+      # 画出用户设置的拉伸区：半透明橙色带 + 边框 + 编号文字。
+      # 拖动中按当前拖动的轴画；没拖动时鼠标指到哪个面心手柄，就按那条轴画。
+      def draw_zones(view)
+        zones = active_zones
+        return if zones.empty?
+
+        box = @drag ? @drag[:base_box] : @box
+        axis = active_zone_axis
+        return if box.nil? || axis.nil?
+
+        zones.each_with_index do |(low, high), index|
+          draw_zone(view, box, axis, low, high, index + 1, zone_clean?(zones, index))
+        end
+      rescue StandardError
+        nil
+      end
+
+      # 这个拉伸区的两条边界是不是落在"平直"的位置（不压斜面 / 锥面）
+      def zone_clean?(zones, index)
+        if @drag && @drag[:zones_clean]
+          return @drag[:zones_clean][index] != false
+        end
+
+        edges = @drag && @drag[:vertex_set] ? @drag[:vertex_set].original_edges : nil
+        box = @drag ? @drag[:base_box] : @box
+        axis = active_zone_axis
+        return true if box.nil? || axis.nil?
+
+        zone_straight?(box, axis, zones[index][0], zones[index][1], edges)
+      end
+
+      def active_zones
+        return @drag[:zones] if @drag && @drag[:zones]
+        return [] unless @state == STATE_EDIT && Settings.middle_stretch?
+
+        Settings.stretch_zones
+      end
+
+      def active_zone_axis
+        handle = @drag ? @drag[:handle] : @hover
+        return handle[:axis] if handle && handle[:type] == :face
+
+        # 没拖动也没指着手柄时：用上次用过的轴，或者变形框最长的那条轴
+        @zone_axis_hint || longest_axis
+      end
+
+      def longest_axis
+        return nil if @box.nil?
+
+        (0...3).max_by { |axis| @box.sizes[axis] }
+      end
+
+      def draw_zone(view, box, axis, low, high, index, clean)
+        others = (0...3).reject { |position| position == axis }
+        corner_at = lambda do |fraction|
+          [[0, 0], [0, 1], [1, 1], [1, 0]].map do |first, second|
+            fractions = [0.0, 0.0, 0.0]
+            fractions[axis] = fraction
+            fractions[others[0]] = first.to_f
+            fractions[others[1]] = second.to_f
+            box_fraction_point(box, fractions)
+          end
+        end
+        near_side = corner_at.call(low)
+        far_side = corner_at.call(high)
+
+        quads = []
+        4.times do |position|
+          following = (position + 1) % 4
+          quads << near_side[position] << near_side[following]
+          quads << far_side[following] << far_side[position]
+        end
+        view.drawing_color = COLOR_ZONE_FILL
+        view.draw(GL_QUADS, quads)
+        view.draw(GL_QUADS, near_side + far_side)
+
+        color = clean ? COLOR_ZONE : COLOR_ZONE_WARN
+        view.line_stipple = ''
+        view.line_width = 2
+        view.drawing_color = color
+        view.draw(GL_LINE_LOOP, near_side)
+        view.draw(GL_LINE_LOOP, far_side)
+        view.draw(GL_LINES, (0...4).flat_map { |position| [near_side[position], far_side[position]] })
+
+        draw_zone_label(view, near_side, far_side, index, low, high, color)
+      rescue StandardError
+        nil
+      end
+
+      def draw_zone_label(view, near_side, far_side, index, low, high, color)
+        anchor = (near_side + far_side).compact.min_by { |point| point.y }
+        screen = view.screen_coords(anchor)
+        return if screen.nil?
+
+        text = format('拉伸区%d %.0f%%~%.0f%%', index, low * 100, high * 100)
+        label = Geom::Point3d.new(screen.x + px(6), screen.y - px(8), 0)
+        begin
+          view.draw_text(label, text, { size: px(13), color: color })
+        rescue StandardError
+          begin
+            view.draw_text(label, text)
+          rescue StandardError
+            nil
+          end
+        end
+      rescue StandardError
+        nil
+      end
+
+      # 拉伸区的两条边界是不是"平直"的（跨过边界的边都平行于拖动轴）
+      def zone_straight?(box, axis, low, high, edges)
+        return true if edges.nil? || edges.empty?
+
+        [low, high].all? do |fraction|
+          edges.all? do |from, to|
+            before = box.normalize(from)[axis] - fraction
+            after = box.normalize(to)[axis] - fraction
+            next true unless before * after < 0
+
+            axis_parallel?(from, to, box, axis)
+          end
+        end
+      rescue StandardError
+        true
       end
 
       def handle_axis_label(handle)
@@ -1278,6 +1557,10 @@ module Ban
       def apply_spec(spec)
         drag = @drag
         if spec[:kind] == :stretch
+          if drag[:zones] && drag[:vertex_set]
+            apply_zone_stretch(spec)
+            return
+          end
           if drag[:cut] && drag[:vertex_set]
             apply_middle_stretch(spec)
             return
@@ -1319,6 +1602,54 @@ module Ban
         end
       end
 
+      # 自定义拉伸区（1~2 个互不相连的区间）：
+      # 总伸长量按区间宽度分配，区间内部沿轴线性拉伸，区间之间和区间之外刚性平移。
+      # 于是只有你设置的这一段被拉长 / 压短，别处的造型一点不动。
+      def apply_zone_stretch(spec)
+        drag = @drag
+        handle = drag[:handle]
+        box = drag[:base_box]
+        axis = handle[:axis]
+        anchor = (1 - handle[:side]).to_i
+        delta = spec[:sizes][axis] - box.sizes[axis]
+        return if delta.abs < 1.0e-9
+
+        zones = drag[:zones].map { |low, high| zone_in_anchor_space(low, high, anchor) }
+        total = zones.inject(0.0) { |sum, (low, high)| sum + (high - low) }
+        return if total <= 0.0
+
+        direction = anchor.zero? ? 1.0 : -1.0
+        drag[:vertex_set].apply do |world|
+          t = box.normalize(world)[axis]
+          ta = anchor.zero? ? t : (1.0 - t)
+          travelled = zone_travel(ta, zones)
+          shift = delta * travelled / total
+          next world if shift.abs < 1.0e-9
+
+          VecMath.point_plus(world, VecMath.scale(box.axes[axis], direction * shift))
+        end
+      end
+
+      # 顶点在拉伸区里"走"了多远（0 = 一点没动，区间宽度之和 = 整体平移到位）
+      def zone_travel(t, zones)
+        travelled = 0.0
+        zones.each do |low, high|
+          width = high - low
+          next if width <= 0.0
+
+          inside = (t - low) / width
+          inside = 0.0 if inside < 0.0
+          inside = 1.0 if inside > 1.0
+          travelled += inside * width
+        end
+        travelled
+      end
+
+      # 用户填的区间是"从变形框起点量"的；这里换算成"从固定端量"（与拖动方向无关）
+      def zone_in_anchor_space(low, high, anchor)
+        anchor.to_i.zero? ? [low, high] : [1.0 - high, 1.0 - low]
+      end
+
       # ta = 距固定端的归一化距离；ta <= cut 的部分不动，其余整体平移 delta
       def middle_stretch_point(box, axis, anchor_side, cut, delta, point)
         t = box.normalize(point)[axis]
@@ -1329,10 +1660,18 @@ module Ban
         VecMath.point_plus(point, VecMath.scale(box.axes[axis], distance))
       end
 
-      # 在"不切断任何特征"的位置找切分面：取相邻顶点之间最大的空档中点，
-      # 并限制在 15% ~ 85% 之间，避免贴到两端
+      # 找"保持造型"的切分面（也就是拉伸区）。
+      #
+      # 切分面必须同时满足两个条件，形状才不会被拉坏：
+      #   1. 落在够宽的空档里（相邻顶点层之间，宽度 ≥ 全长的 20%），
+      #      这样不会把一排面从中间劈开；
+      #   2. 跨过切分面的每一条边都平行于拖动轴——这时跨切分面的面都是
+      #      "顺着轴"的侧面，拉长它们等于把物体加长；斜角、凹槽、锥面
+      #      这些造型不跨切分面，于是原样保留。
+      # 位置优先取物体中部的 48%~52%，做不到时取离中部最近的有效位置。
+      # 找不到有效位置时返回 nil，调用方退回整体缩放。
       def middle_cut_position(vertex_set, handle, box)
-        return 0.5 if vertex_set.nil? || vertex_set.size.zero?
+        return nil if vertex_set.nil? || vertex_set.size.zero?
 
         axis = handle[:axis]
         anchor = (1 - handle[:side]).to_i
@@ -1342,23 +1681,63 @@ module Ban
         end
         values.sort!
 
-        best_gap = 0.0
-        best_cut = 0.5
+        extent = values.last - values.first
+        return nil if extent <= 1.0e-6
+
+        spans = []
         previous = nil
         values.each do |value|
-          if previous
-            gap = value - previous
-            middle = (value + previous) * 0.5
-            if gap > best_gap && middle >= 0.15 && middle <= 0.85
-              best_gap = gap
-              best_cut = middle
-            end
-          end
+          spans << [previous, value] if previous && (value - previous) >= extent * MIN_CLEAN_GAP_RATIO
           previous = value
         end
-        best_cut
+        return nil if spans.empty?
+
+        # ta 是从"固定端"量的：ta 越接近 0.5 就越接近物体中部
+        edges = vertex_set.original_edges
+        candidates = spans.map { |from, to| preferred_cut(from, to) }
+        candidates.sort_by! { |cut| [(cut - 0.5).abs, cut] }
+        candidates.each do |cut|
+          return cut if straight_cut?(cut, axis, anchor, box, edges)
+        end
+        nil
       rescue StandardError
-        0.5
+        nil
+      end
+
+      # 在空档 [from, to] 内取最贴近物体中部 48%~52% 的切分面
+      def preferred_cut(from, to)
+        width = to - from
+        inset = [width * CUT_INSET_RATIO, MAX_CUT_INSET].min
+        low = from + inset
+        high = to - inset
+        return (low + high) * 0.5 if high <= low
+
+        target_low = [low, MID_BAND_LO].max
+        target_high = [high, MID_BAND_HI].min
+        return (target_low + target_high) * 0.5 if target_low <= target_high
+
+        # 中部落在空档之外时，取空档里离中部最近的位置
+        [[0.5, low].max, high].min
+      end
+
+      # 切分面是否"平直"：跨过它的边都必须平行于拖动轴
+      def straight_cut?(cut, axis, anchor, box, edges)
+        plane = anchor.zero? ? cut : (1.0 - cut)
+        edges.all? do |from, to|
+          before = box.normalize(from)[axis] - plane
+          after = box.normalize(to)[axis] - plane
+          next true unless before * after < 0
+
+          axis_parallel?(from, to, box, axis)
+        end
+      end
+
+      def axis_parallel?(from, to, box, axis)
+        direction = VecMath.point_minus(to, from)
+        length = VecMath.length(direction)
+        return true if length <= 1.0e-9
+
+        VecMath.dot(direction, box.axes[axis]).abs >= length * PARALLEL_COS
       end
 
       def stretch_transformation(base, new_box)
@@ -1664,6 +2043,11 @@ module Ban
         sizes.map { |size| Sketchup.format_length(size.abs) }.join(' × ')
       end
 
+      # [[0.3, 0.4], [0.6, 0.7]] -> "30%~40% + 60%~70%"
+      def zone_label(zones)
+        zones.map { |low, high| format('%.0f%%~%.0f%%', low * 100, high * 100) }.join(' + ')
+      end
+
       # ---- 绘制细节 ------------------------------------------------------
 
       def box_edges(box, mapper = nil)
@@ -1702,6 +2086,31 @@ module Ban
                                COLOR_BOX
                              end
         view.draw(GL_LINES, box_edges(@box))
+      end
+
+      # 在变形框最高角的上方写出当前模式名（橙=拉伸缩放，紫=收分），
+      # 避免用户误以为在做另一种变形
+      def draw_mode_badge(view)
+        return if @box.nil?
+
+        top = @box.corners.map { |point| view.screen_coords(point) }.compact.min_by { |point| point.y }
+        return if top.nil?
+
+        text = MODE_LABEL[@mode]
+        color = @mode == :taper ? MODE_BADGE_TAPER : MODE_BADGE_STRETCH
+        half = px(4 * MODE_BADGE_FONT / 2)
+        label = Geom::Point3d.new(top.x - half, top.y - px(MODE_BADGE_FONT + 6), 0)
+        begin
+          view.draw_text(label, text, { size: px(MODE_BADGE_FONT), color: color })
+        rescue StandardError
+          begin
+            view.draw_text(label, text)
+          rescue StandardError
+            nil
+          end
+        end
+      rescue StandardError
+        nil
       end
 
       def draw_taper_guide(view)
@@ -1748,9 +2157,15 @@ module Ban
         if @drag
           lines << "已锁定：框 #{handle_axis_label(@drag[:handle])} 轴（移动鼠标缩放，再点一下应用）"
           lines << "拾取：#{@snap_kind}" unless @snap_kind.to_s.empty?
-          if @drag[:cut]
+          if @drag[:zones]
+            lines << "保持造型：拉伸区 #{zone_label(@drag[:zones])}（其他部分整体平移）"
+          elsif @drag[:cut]
             lines << format('保持造型：只拉伸中段（切分在 %.0f%% 处）', @drag[:cut] * 100)
+          elsif Settings.middle_stretch? && @drag[:vertex_set]
+            lines << '保持造型：中部没有平直的切分位置，本次按整体缩放'
           end
+        elsif @state == STATE_EDIT && Settings.middle_stretch? && !Settings.stretch_zones.empty?
+          lines << "拉伸区（面心拉伸）：#{zone_label(Settings.stretch_zones)}"
         end
         spec = @drag && @drag[:spec]
 
@@ -1818,7 +2233,7 @@ module Ban
         view.line_stipple = ''
         view.line_width = 1
         begin
-          view.drawing_color = COLOR_BUTTON_BG
+          view.drawing_color = @mode == :taper ? COLOR_BUTTON_BG_TAPER : COLOR_BUTTON_BG
           view.draw2d(GL_POLYGON, corners)
         rescue StandardError
           begin
@@ -1828,7 +2243,7 @@ module Ban
           end
         end
         begin
-          view.drawing_color = COLOR_BUTTON_EDGE
+          view.drawing_color = @mode == :taper ? COLOR_BUTTON_EDGE_TAPER : COLOR_BUTTON_EDGE
           view.draw2d(GL_LINE_LOOP, corners)
         rescue StandardError
           nil
