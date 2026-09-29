@@ -31,7 +31,8 @@ def defined_methods(source)
 end
 
 def defined_constants(source)
-  source.scan(/^\s{2,}([A-Z][A-Z0-9_]*)\s*=/).flatten
+  # 注意排除 => 与 ==：否则 `VK_RIGHT => 0` 这种哈希项会被误判成"常量定义"
+  source.scan(/^\s{2,}([A-Z][A-Z0-9_]*)\s*=(?!=|>)/).flatten
 end
 
 # 统计引用次数（定义处算 1 次）
@@ -57,7 +58,7 @@ SOURCES.each do |file, source|
     found = true
   end
 end
-puts '  (无)' unless found
+puts '  （无）' unless found
 
 puts
 puts '=== 未被引用的常量 ==='
@@ -70,4 +71,4 @@ SOURCES.each do |file, source|
     found = true
   end
 end
-puts '  (无)' unless found
+puts '  （无）' unless found

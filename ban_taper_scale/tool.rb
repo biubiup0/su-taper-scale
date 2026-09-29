@@ -46,6 +46,11 @@ module Ban
       PARALLEL_COS = 0.999
       # SketchUp 内置指针 ID：0 = 系统默认箭头
       DEFAULT_CURSOR_ID = 0
+      # 方向键锁定拉伸轴（沿用 SketchUp 自带工具的约定）：
+      # → 红轴 X，← 绿轴 Y，↑ / ↓ 蓝轴 Z；再按同一个键 = 解除锁定
+      AXIS_KEY_AXES = {
+        VK_RIGHT => 0, VK_LEFT => 1, VK_UP => 2, VK_DOWN => 2
+      }.freeze
 
       # 工具状态：等待选择对象 / 已有变形框
       STATE_SELECT = :select
@@ -129,6 +134,7 @@ module Ban
         @parent_entities = nil
         @edit_tr = Geom::Transformation.new
         @drag = nil
+        @two_point = nil
         @hover = nil
         @ip = Sketchup::InputPoint.new
         @ref_ip = Sketchup::InputPoint.new
@@ -156,6 +162,7 @@ module Ban
         reset_cursor
         @drag = nil
         @hover = nil
+        @two_point = nil
         @message = ''
         refresh_context(model)
         if @targets.empty?
@@ -175,6 +182,7 @@ module Ban
 
       def deactivate(view)
         cancel_drag(view) if @drag
+        @two_point = nil
         @preview_entity = nil
         set_vcb('', '')
         Sketchup.status_text = ''
@@ -188,6 +196,7 @@ module Ban
         reset_cursor
         refresh_context(model)
         @drag = nil
+        @two_point = nil
         @hover = nil
         if @targets.empty?
           enter_select_state(model)
@@ -204,6 +213,7 @@ module Ban
         @state = STATE_SELECT
         @box = nil
         @hover = nil
+        @two_point = nil
         @preview_entity = nil
         @message = ''
         model.selection.clear
@@ -273,6 +283,11 @@ module Ban
 
         id = menu.add_item('面心拉伸：拉伸区域＝自动（物体中部）') { set_stretch_zones('', false) }
         menu.set_validation_proc(id) { Settings.stretch_zones.empty? ? MF_CHECKED : MF_ENABLED }
+
+        id = menu.add_item('拉伸到点…（先点原位置，再点目标点）') { start_two_point }
+        menu.set_validation_proc(id) do
+          @state == STATE_EDIT && @box && @mode == :stretch ? MF_ENABLED : MF_GRAYED
+        end
 
         menu.add_separator
         menu.add_item('退出工具') { Sketchup.active_model.select_tool(nil) }
@@ -535,7 +550,9 @@ module Ban
       # ------------------------------------------------------------ 鼠标事件
 
       def onMouseMove(_flags, x, y, view)
-        if @drag
+        if @two_point && !@two_point[:from].nil?
+          two_point_move(x, y, view)
+        elsif @drag
           update_drag(x, y, view)
         elsif @state == STATE_SELECT
           entity = pick_entity(view, x, y)
@@ -555,6 +572,12 @@ module Ban
       end
 
       def onLButtonDown(flags, x, y, view)
+        # 两点定位拉伸：第一下选"要移动的位置"，第二下选目标点
+        if @two_point
+          two_point_click(flags, x, y, view)
+          return
+        end
+
         if @drag
           # 已经锁定方向轴：再点一下 = 应用当前结果
           commit_drag(view) if @drag[:sticky]
@@ -640,6 +663,235 @@ module Ban
         view.invalidate
       end
 
+      # ---- 两点定位拉伸 --------------------------------------------------
+      #
+      # 用法：「拉伸到点…」→ 第一下点对象上"要移动的位置"，
+      # 第二下点它要去的目标点（可以吸到别的物体的角点 / 端点 / 圆心）。
+      # 对象沿变形框的那条轴拉伸（仍是"保持造型"的规则），
+      # 使第一点正好落到第二点上。
+
+      def start_two_point
+        if @box.nil? || @state != STATE_EDIT
+          UI.messagebox('请先点选要缩放的对象，再用「拉伸到点」。')
+          return
+        end
+        if @mode != :stretch
+          UI.messagebox('「拉伸到点」只在拉伸缩放模式下可用。')
+          return
+        end
+
+        cancel_drag(Sketchup.active_model.active_view) if @drag
+        handle = @hover
+        handle = nil unless handle && handle[:type] == :face
+        @two_point = { handle: handle, axis: handle && handle[:axis], from: nil, to: nil, xy: nil }
+        @message = ''
+        @flash_text = '拉伸到点：先点"要移动的位置"，再点"目标点"'
+        @flash_until = Time.now + FLASH_SECONDS
+        update_ui
+        Sketchup.active_model.active_view.invalidate
+        schedule_redraw
+      end
+
+      # 方向键：锁定 / 解除锁定拉伸轴（只在本功能里接管，其它键一律放行）
+      def onKeyDown(key, _repeat, _flags, view)
+        axis = AXIS_KEY_AXES[key]
+        return false if axis.nil? || @two_point.nil?
+
+        @two_point[:axis] = @two_point[:axis] == axis ? nil : axis
+        @two_point[:handle] = nil
+        @flash_text = if @two_point[:axis]
+                        "已锁定拉伸轴：#{AXIS_LABEL[@two_point[:axis]]} 轴（再按一次解除）"
+                      else
+                        '已解除轴向锁定（自动判断）'
+                      end
+        @flash_until = Time.now + FLASH_SECONDS
+        refresh_two_point_preview(view)
+        update_ui
+        view.invalidate
+        true
+      rescue StandardError
+        false
+      end
+
+      def refresh_two_point_preview(view)
+        return if @two_point.nil? || @two_point[:from].nil? || @two_point[:to].nil?
+
+        x, y = @two_point[:xy] || [0, 0]
+        preview_two_point(x, y, view, @two_point[:to])
+      end
+
+      def cancel_two_point
+        @two_point = nil
+        cancel_drag(Sketchup.active_model.active_view) if @drag
+      end
+
+      def two_point_click(flags, x, y, view)
+        if @two_point[:from].nil?
+          two_point_first_click(x, y, view)
+        else
+          finish_two_point(flags, x, y, view)
+        end
+      end
+
+      def two_point_first_click(x, y, view)
+        point = two_point_pick(view, x, y)
+        return if point.nil?
+
+        @two_point[:from] = point
+        @two_point[:to] = point
+        @two_point[:xy] = [x, y]
+        update_ui
+        view.invalidate
+      end
+
+      def finish_two_point(_flags, x, y, view)
+        target = two_point_pick(view, x, y)
+        preview_two_point(x, y, view, target) if target
+        @two_point = nil
+        if @drag && @drag[:moved]
+          commit_drag(view)
+        else
+          cancel_drag(view)
+          @message = '两点重合，没有产生变形'
+          update_ui
+          view.invalidate
+        end
+      end
+
+      def two_point_move(x, y, view)
+        target = two_point_pick(view, x, y)
+        return if target.nil?
+
+        @two_point[:to] = target
+        @two_point[:xy] = [x, y]
+        preview_two_point(x, y, view, target)
+      end
+
+      def preview_two_point(x, y, view, target)
+        return if @two_point.nil? || target.nil?
+
+        from = @two_point[:from]
+        return if from.nil?
+
+        # 拉伸轴按"两点差"实时决定：拖到哪条轴为主，就沿哪条轴拉伸
+        handle = @two_point[:handle] || two_point_handle(from, target)
+        return if handle.nil?
+
+        start_two_point_drag(handle, x, y) if @drag.nil? || !same_handle?(@drag[:handle], handle)
+
+        drag = @drag
+        return if drag.nil?
+
+        spec = two_point_spec(drag, from, target)
+        return if spec.nil? || same_spec?(spec, drag[:spec])
+
+        drag[:moved] = true
+        drag[:spec] = spec
+        apply_spec(spec)
+        update_ui
+        view.invalidate
+      end
+
+      # 两点模式的变形量：不管走哪条路径，都让"起点"精确落到"目标点"。
+      #   · 保持造型（切分面 / 拉伸区）：起点跟着平移，位移 = 投影 / 起点走满的比例
+      #   · 整体缩放：以固定端为基准等比缩放，缩放比 = 目标点距固定端 / 起点距固定端
+      def two_point_spec(drag, from, target)
+        box = drag[:base_box]
+        handle = drag[:handle]
+        axis = handle[:axis]
+        anchor = (1 - handle[:side]).to_i
+        sizes = box.sizes.dup
+        anchors = drag[:spec][:anchors].dup
+        anchors[axis] = anchor
+
+        if drag[:cut] || drag[:zones]
+          fraction = source_travel_fraction(drag, from)
+          return nil if fraction.nil? || fraction <= 1.0e-6
+
+          projected = VecMath.dot(VecMath.point_minus(target, from), box.axes[axis])
+          delta = (anchor.zero? ? projected : -projected) / fraction
+          sizes[axis] = DeformBox.clamp_size(box.sizes[axis] + delta)
+        else
+          source_distance = anchor.zero? ? box.project(from, axis) : box.sizes[axis] - box.project(from, axis)
+          target_distance = anchor.zero? ? box.project(target, axis) : box.sizes[axis] - box.project(target, axis)
+          return nil if source_distance <= 1.0e-9
+
+          sizes[axis] = DeformBox.clamp_size(box.sizes[axis] * target_distance / source_distance)
+        end
+
+        { kind: :stretch, anchors: anchors, sizes: sizes }
+      end
+
+      # 起点在这套变形里"走满全程"的比例：1 = 完全跟着平移，0 = 完全不动
+      def source_travel_fraction(drag, from)
+        box = drag[:base_box]
+        handle = drag[:handle]
+        axis = handle[:axis]
+        anchor = (1 - handle[:side]).to_i
+        t = box.normalize(from)[axis]
+        ta = anchor.zero? ? t : (1.0 - t)
+
+        if drag[:zones]
+          zones = drag[:zones].map { |low, high| zone_in_anchor_space(low, high, anchor) }
+          total = zones.inject(0.0) { |sum, (low, high)| sum + (high - low) }
+          return nil if total <= 0.0
+
+          return zone_travel(ta, zones) / total
+        end
+
+        drag[:cut] && ta > drag[:cut] ? 1.0 : 0.0
+      end
+
+      def start_two_point_drag(handle, x, y)
+        cancel_drag(Sketchup.active_model.active_view) if @drag
+        Sketchup.active_model.start_operation(OP_NAME, false)
+        start_drag(handle, false, x, y)
+      end
+
+      # 两点模式的取点：SketchUp 推理点 -> 自研特征点 -> 鼠标射线
+      def two_point_pick(view, x, y)
+        @ip.pick(view, x * dpi, y * dpi, @ref_ip)
+        @snap_tooltip = input_point_tooltip
+        @snapped = snapped?
+
+        if Settings.snap?
+          if @snapped
+            @snap_point = @ip.position
+            @snap_kind = snap_label
+            return @snap_point
+          end
+
+          found = feature_snap_point(view, x, y)
+          if found
+            @snap_point = found[0]
+            @snap_kind = found[1]
+            return @snap_point
+          end
+        end
+
+        @snap_point = nil
+        @snap_kind = ''
+        @ip.position
+      end
+
+      # 没预先指定手柄时：拉伸轴 = 两点差最大的那条框轴；固定端 = 离起点远的那一端
+      def two_point_handle(from, target)
+        return nil if @box.nil?
+
+        # 方向键锁定过的轴优先；没锁就取两点差最大的那条轴
+        axis = @two_point && @two_point[:axis]
+        axis ||= begin
+          vector = VecMath.point_minus(target, from)
+          (0...3).max_by { |index| VecMath.dot(vector, @box.axes[index]).abs }
+        end
+        return nil if axis.nil?
+
+        side = @box.normalize(from)[axis] >= 0.5 ? 1 : 0
+        handles.find do |handle|
+          handle[:type] == :face && handle[:axis] == axis && handle[:side] == side
+        end
+      end
+
       def start_drag(handle, copy, x, y)
         @zone_axis_hint = handle[:axis] if handle[:type] == :face
         drag = {
@@ -666,7 +918,8 @@ module Ban
           drag[:vertex_set] = collect_vertices
           zones = Settings.stretch_zones
           if zones.empty?
-            drag[:cut] = middle_cut_position(drag[:vertex_set], handle, @box)
+            drag[:cut] = middle_cut_position(drag[:vertex_set], handle, @box,
+                                             before: two_point_cut_limit(handle))
           else
             drag[:zones] = zones
             # 平直与否在这里算一次，绘制时直接用（免得每帧扫全模型的边）
@@ -683,6 +936,14 @@ module Ban
       end
 
       def onLButtonUp(_flags, x, y, view)
+        # 两点模式：第一下"按住拖到目标点松手"也算确认（点两下的另一种手势）
+        if @two_point
+          if !@two_point[:from].nil? && @drag && dragged_far?(x, y)
+            finish_two_point(_flags, x, y, view)
+          end
+          return
+        end
+
         return unless @drag
 
         update_drag(x, y, view)
@@ -696,9 +957,22 @@ module Ban
         end
       end
 
+      # 按下点与当前位置的屏幕距离是否已经算"拖动"
+      def dragged_far?(x, y)
+        down = @drag && @drag[:down]
+        return false if down.nil?
+
+        Math.sqrt((x - down[0])**2 + (y - down[1])**2) > DRAG_TOLERANCE_PX * 4
+      end
+
       # reason: 0 = Esc，1 = 工具被重新激活，2 = 撤销/重做
       def onCancel(reason, view)
-        if @drag
+        if @two_point
+          cancel_two_point
+          @message = '已取消「拉伸到点」'
+          update_ui
+          view.invalidate
+        elsif @drag
           cancel_drag(view)
         elsif reason == 2
           # 撤销 / 重做：刷新变形框，工具保持激活
@@ -776,6 +1050,7 @@ module Ban
         draw_axis_lock(view) if @drag
         draw_cut_plane(view)
         draw_zones(view)
+        draw_two_point(view)
         draw_input_point(view)
         draw_taper_guide(view) if @mode == :taper
         draw_handles(view)
@@ -903,6 +1178,71 @@ module Ban
 
         zones.each_with_index do |(low, high), index|
           draw_zone(view, box, axis, low, high, index + 1, zone_clean?(zones, index))
+        end
+      rescue StandardError
+        nil
+      end
+
+      # 两点定位拉伸的标记：起点、目标点、以及两点之间的连线
+      def draw_two_point(view)
+        return if @two_point.nil?
+
+        # 锁定了轴就先画"极轴"参考线，让用户看清目标点被约束在哪条线上
+        if @two_point[:axis] && @box
+          base = @two_point[:from] || box_fraction_point(@box, [0.5, 0.5, 0.5])
+          draw_axis_line(view, @box, @two_point[:axis], base)
+        end
+
+        return if @two_point[:from].nil?
+
+        from = @two_point[:from]
+        target = two_point_landing(from) || @snap_point
+        view.line_stipple = ''
+        view.line_width = 2
+        view.drawing_color = COLOR_SNAP
+        view.draw_points([from], px(9), DRAW_FILLED_SQUARE, COLOR_SNAP)
+        view.draw_points([from], px(17), DRAW_OPEN_SQUARE, COLOR_SNAP)
+        draw_two_point_label(view, from, '起点')
+        return if target.nil?
+
+        view.draw(GL_LINES, [from, target])
+        view.draw_points([target], px(9), DRAW_FILLED_SQUARE, COLOR_SNAP)
+        view.draw_points([target], px(17), DRAW_OPEN_SQUARE, COLOR_SNAP)
+        draw_two_point_label(view, target, '目标点')
+      rescue StandardError
+        nil
+      end
+
+      # 目标点被极轴约束后的实际落点
+      def two_point_landing(from)
+        target = @two_point[:to]
+        return nil if target.nil? || from.nil?
+
+        handle = @drag && @drag[:handle]
+        axis = (handle && handle[:axis]) || @two_point[:axis]
+        box = @drag ? @drag[:base_box] : @box
+        return target if axis.nil? || box.nil?
+
+        direction = box.axes[axis]
+        delta = VecMath.dot(VecMath.point_minus(target, from), direction)
+        VecMath.point_plus(from, VecMath.scale(direction, delta))
+      rescue StandardError
+        nil
+      end
+
+      def draw_two_point_label(view, point, text)
+        screen = view.screen_coords(point)
+        return if screen.nil?
+
+        label = Geom::Point3d.new(screen.x + px(8), screen.y + px(8), 0)
+        begin
+          view.draw_text(label, text, { size: px(13), color: COLOR_SNAP })
+        rescue StandardError
+          begin
+            view.draw_text(label, text)
+          rescue StandardError
+            nil
+          end
         end
       rescue StandardError
         nil
@@ -1670,7 +2010,7 @@ module Ban
       #      这些造型不跨切分面，于是原样保留。
       # 位置优先取物体中部的 48%~52%，做不到时取离中部最近的有效位置。
       # 找不到有效位置时返回 nil，调用方退回整体缩放。
-      def middle_cut_position(vertex_set, handle, box)
+      def middle_cut_position(vertex_set, handle, box, before: nil)
         return nil if vertex_set.nil? || vertex_set.size.zero?
 
         axis = handle[:axis]
@@ -1695,6 +2035,10 @@ module Ban
         # ta 是从"固定端"量的：ta 越接近 0.5 就越接近物体中部
         edges = vertex_set.original_edges
         candidates = spans.map { |from, to| preferred_cut(from, to) }
+        # 两点模式：切分面必须在起点之前，保证起点真的会跟着平移
+        candidates.reject! { |cut| !before.nil? && cut >= before } unless before.nil?
+        return nil if candidates.empty?
+
         candidates.sort_by! { |cut| [(cut - 0.5).abs, cut] }
         candidates.each do |cut|
           return cut if straight_cut?(cut, axis, anchor, box, edges)
@@ -1718,6 +2062,19 @@ module Ban
 
         # 中部落在空档之外时，取空档里离中部最近的位置
         [[0.5, low].max, high].min
+      end
+
+      # 两点模式：切分面必须落在起点之前（ta 更小的一侧），
+      # 否则起点在被固定的那一段里，点了也不会动。
+      def two_point_cut_limit(handle)
+        return nil if @two_point.nil? || @two_point[:from].nil? || @box.nil?
+
+        anchor = (1 - handle[:side]).to_i
+        t = @box.normalize(@two_point[:from])[handle[:axis]]
+        ta = anchor.zero? ? t : (1.0 - t)
+        ta - 0.01
+      rescue StandardError
+        nil
       end
 
       # 切分面是否"平直"：跨过它的边都必须平行于拖动轴
@@ -2153,6 +2510,18 @@ module Ban
         else
           draw_mode_button(view)
           lines << "模式：#{MODE_LABEL[@mode]}（#{MODE_HINT[@mode]}）"
+        end
+        if @two_point
+          if @two_point[:from].nil?
+            lines << '拉伸到点：点第一下 = 选"要移动的位置"（可吸附端点 / 角点 / 圆心）'
+          else
+            lines << '拉伸到点：移动到目标点 → 再点一下应用（Esc 取消）'
+          end
+          lines << if @two_point[:axis]
+                     "已锁定拉伸轴：#{AXIS_LABEL[@two_point[:axis]]} 轴（按同一个方向键解除）"
+                   else
+                     '方向键 → ← ↑ ↓ 可锁定 X / Y / Z 轴'
+                   end
         end
         if @drag
           lines << "已锁定：框 #{handle_axis_label(@drag[:handle])} 轴（移动鼠标缩放，再点一下应用）"
