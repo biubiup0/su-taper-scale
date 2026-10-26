@@ -46,6 +46,48 @@ module Ban
         Sketchup.write_default(SECTION, 'middle_stretch', value ? true : false)
       end
 
+      # 收分曲线：直线 / S 形，另加一个"曲度"让中段外鼓或内收。
+      # 曲度为 0 时与旧版本（纯直线收分）完全一致。
+      TAPER_CURVES = %w[linear smooth].freeze
+      MAX_TAPER_BULGE = 0.95
+
+      def taper_curve
+        value = Sketchup.read_default(SECTION, 'taper_curve', 'linear').to_s
+        TAPER_CURVES.include?(value) ? value.to_sym : :linear
+      end
+
+      def taper_curve=(value)
+        name = value.to_s
+        name = 'linear' unless TAPER_CURVES.include?(name)
+        Sketchup.write_default(SECTION, 'taper_curve', name)
+      end
+
+      def taper_bulge
+        value = Sketchup.read_default(SECTION, 'taper_bulge', 0.0).to_f
+        value = MAX_TAPER_BULGE if value > MAX_TAPER_BULGE
+        value = -MAX_TAPER_BULGE if value < -MAX_TAPER_BULGE
+        value
+      rescue StandardError
+        0.0
+      end
+
+      def taper_bulge=(value)
+        number = value.to_f
+        number = MAX_TAPER_BULGE if number > MAX_TAPER_BULGE
+        number = -MAX_TAPER_BULGE if number < -MAX_TAPER_BULGE
+        Sketchup.write_default(SECTION, 'taper_bulge', number)
+      end
+
+      def taper_profile
+        { curve: taper_curve, bulge: taper_bulge }
+      end
+
+      def taper_profile=(profile)
+        profile ||= {}
+        self.taper_curve = profile[:curve] || profile['curve'] || :linear
+        self.taper_bulge = profile[:bulge] || profile['bulge'] || 0.0
+      end
+
       # 面心"保持造型"拉伸的拉伸区。
       # 留空 = 自动（取物体中部的平直位置）；也可以手动指定 1~2 个互不相连的区间，
       # 写成 "30-40" 或 "30-40,60-70"（百分比，按变形框轴线量，0% = 变形框起点）。

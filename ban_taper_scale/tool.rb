@@ -31,6 +31,15 @@ module Ban
         stretch: '角点 + 面心手柄',
         taper: '只有面心手柄（沿轴收分）'
       }.freeze
+      # 收分曲线预设（右键菜单）；曲度只改中段，两端截面不变
+      TAPER_PRESETS = [
+        { label: '直线（默认）', profile: { curve: :linear, bulge: 0.0 } },
+        { label: 'S 形（两端过渡更缓）', profile: { curve: :smooth, bulge: 0.0 } },
+        { label: '鼓形（中段外凸）', profile: { curve: :linear, bulge: 0.3 } },
+        { label: '收腰（中段内凹 / 花瓶）', profile: { curve: :linear, bulge: -0.3 } }
+      ].freeze
+      # 收分轮廓每条棱采样多少段（鼓形 / 花瓶要看得出弧线）
+      TAPER_CURVE_SAMPLES = 24
       FLASH_SECONDS = 1.8
       # 「保持造型」的切分面（拉伸区）默认放在物体中部这一段。
       MID_BAND_LO = 0.48
@@ -260,6 +269,16 @@ module Ban
           menu.set_validation_proc(id) { @mode == mode ? MF_CHECKED : MF_ENABLED }
         end
 
+        curve_menu = menu.add_submenu('收分曲线')
+        TAPER_PRESETS.each do |preset|
+          id = curve_menu.add_item(preset[:label]) { set_taper_profile(preset[:profile]) }
+          curve_menu.set_validation_proc(id) do
+            DeformMath.same_profile?(Settings.taper_profile, preset[:profile]) ? MF_CHECKED : MF_ENABLED
+          end
+        end
+        curve_menu.add_separator
+        curve_menu.add_item('曲度设置…（负 = 收腰，正 = 鼓形）') { edit_taper_profile }
+
         menu.add_separator
 
         id = menu.add_item('变形框对齐对象坐标') { toggle_object_axes }
@@ -347,6 +366,48 @@ module Ban
         Settings.middle_stretch = value
       end
 
+      # 右键「收分曲线」：设置形状 + 曲度，并立刻作用在当前拖动上
+      def set_taper_profile(profile)
+        Settings.taper_profile = profile
+        normalized = Settings.taper_profile
+        if @drag && @drag[:mode] == :taper
+          @drag[:profile] = normalized
+          if @drag[:moved] && @drag[:spec]
+            @drag[:spec][:profile] = normalized
+            apply_spec(@drag[:spec])
+          end
+        end
+        @flash_text = "收分曲线：#{DeformMath.profile_label(normalized)}"
+        @flash_until = Time.now + FLASH_SECONDS
+        update_ui
+        Sketchup.active_model.active_view.invalidate
+        schedule_redraw
+      rescue StandardError
+        nil
+      end
+
+      # 曲度对话框：曲线形状 + 一个 -0.95~0.95 的曲度
+      def edit_taper_profile
+        current = Settings.taper_profile
+        labels = [
+          '收分曲线形状',
+          '曲度（0 = 直线过渡；负 = 中段收腰；正 = 中段鼓出）'
+        ]
+        defaults = [
+          DeformMath::CURVE_LABELS[current[:curve]],
+          format('%.2f', current[:bulge])
+        ]
+        lists = ['直线|S 形', '']
+        input = UI.inputbox(labels, defaults, lists, '收分曲线设置')
+        return if input.nil? || input == false
+
+        curve = input[0].to_s.include?('S') ? :smooth : :linear
+        bulge = input[1].to_s.strip.to_f
+        set_taper_profile({ curve: curve, bulge: bulge })
+      rescue StandardError => error
+        UI.messagebox("收分曲线设置失败：#{error.message}")
+      end
+
       # 右键「拉伸区域设置…」：填 1~2 个区间，留空 = 自动取物体中部
       def edit_stretch_zones
         current = Settings.stretch_zones
@@ -396,8 +457,9 @@ module Ban
       # ---- 精确输入（右键）------------------------------------------------
 
       # 右键「精确输入…」：
-      #   拉伸缩放 → 输入沿轴的增量，正数延长、负数缩短（无单位按模型单位）
-      #   收分     → 输入两个方向的收分比
+      #   拉伸缩放 → 输入目标尺寸（输入 1200 就是让这一轴变成 1200；
+      #              输入 +100 / -100 才是增加 / 减少 100）
+      #   收分     → 输入两个方向的收分比（比例本身就是绝对值）
       def exact_input
         handle = @drag ? @drag[:handle] : @hover
         if handle.nil?
@@ -438,11 +500,15 @@ module Ban
         @drag[:moved] = true
         apply_spec(spec)
         commit_drag(model.active_view)
-        @message = "已精确输入：#{describe_spec(spec)}"
+        @message = if spec[:kind] == :stretch
+                     "已精确输入：目标尺寸 #{format_sizes(spec[:sizes])}"
+                   else
+                     "已精确输入：收分比 #{spec[:factors].map { |factor| format('%.3f', factor) }.join(' × ')}"
+                   end
         update_ui
       end
 
-      # 弹出输入框，返回 {:kind=>:deltas, :list=>[[axis, inches], ...]}
+      # 弹出输入框，返回 {:kind=>:sizes, :list=>[[axis, parsed], ...]}
       # 或 {:kind=>:factors, :list=>[ratio, ratio]}
       def prompt_exact_values
         handle = @drag[:handle]
@@ -461,13 +527,16 @@ module Ban
           axes = handle[:type] == :corner ? [0, 1, 2] : [handle[:axis]]
           unit = unit_name
           labels = axes.map do |axis|
-            "沿框 #{AXIS_LABEL[axis]} 轴增量（#{unit}，正数延长 / 负数缩短）"
+            "框 #{AXIS_LABEL[axis]} 轴目标尺寸（#{unit}；填 +100 / -100 表示增加 / 减少）"
           end
-          input = UI.inputbox(labels, Array.new(axes.size, '0'), '精确缩放')
+          defaults = axes.map do |axis|
+            format('%.2f', @drag[:base_box].sizes[axis] / model_unit_factor)
+          end
+          input = UI.inputbox(labels, defaults, '精确缩放（输入目标尺寸）')
           return nil unless input
 
-          list = axes.each_with_index.map { |axis, index| [axis, parse_length_input(input[index])] }
-          { kind: :deltas, list: list }
+          list = axes.each_with_index.map { |axis, index| [axis, parse_size_input(input[index])] }
+          { kind: :sizes, list: list }
         end
       end
 
@@ -479,22 +548,25 @@ module Ban
           return nil if values[:list].size != 2
 
           { kind: :taper, axis: handle[:axis], anchor: 1 - handle[:side],
-            factors: values[:list].map { |factor| DeformMath.clamp_factor(factor) } }
+            factors: values[:list].map { |factor| DeformMath.clamp_factor(factor) },
+            profile: @drag[:profile] }
         else
           return nil if values[:list].empty?
 
-          spec_from_deltas(values[:list], handle, box)
-        end
-      end
+          sizes = box.sizes.dup
+          anchors = [0, 0, 0]
+          values[:list].each do |axis, parsed|
+            next if parsed[:kind] == :keep
 
-      def spec_from_deltas(list, handle, box)
-        sizes = box.sizes.dup
-        anchors = [0, 0, 0]
-        list.each do |axis, delta|
-          anchors[axis] = 1 - axis_side_of(handle, axis)
-          sizes[axis] = DeformBox.clamp_size(box.sizes[axis] + delta)
+            anchors[axis] = 1 - axis_side_of(handle, axis)
+            target = parsed[:kind] == :delta ? box.sizes[axis] + parsed[:inches] : parsed[:inches]
+            sizes[axis] = DeformBox.clamp_size(target)
+          end
+          # 一个字段都没改（或都填了当前值）：别留下一个空的撤销步骤
+          return nil if (0...3).all? { |axis| (sizes[axis] - box.sizes[axis]).abs < 1.0e-9 }
+
+          { kind: :stretch, anchors: anchors, sizes: sizes }
         end
-        { kind: :stretch, anchors: anchors, sizes: sizes }
       end
 
       def axis_side_of(handle, axis)
@@ -504,17 +576,21 @@ module Ban
         0
       end
 
-      def parse_length_input(text)
-        value = text.to_s.strip
-        return 0.0 if value.empty?
+      # 输入框里的尺寸：空 = 不改；+100 / -100 = 增量；100 / 100mm = 目标尺寸
+      def parse_size_input(text)
+        raw = text.to_s.strip
+        return { kind: :keep } if raw.empty?
 
-        if value =~ /\A[-+]?(?:\d+\.?\d*|\.\d+)\z/
-          value.to_f * model_unit_factor
+        value = parse_value(raw)
+        return { kind: :keep } if value.nil? || value[:kind] == :ratio
+
+        if value[:signed]
+          { kind: :delta, inches: value[:inches] }
         else
-          value.to_l.to_f
+          { kind: :size, inches: value[:inches] }
         end
       rescue StandardError
-        0.0
+        { kind: :keep }
       end
 
       def model_unit_factor
@@ -902,6 +978,8 @@ module Ban
           anchor_point: handle[:pos],
           down: (x && y) ? [x, y] : nil,
           spec: initial_spec(handle),
+          # 收分曲线在拖动开始时固定下来，中途改设置也不会让手里这次跳变
+          profile: @mode == :taper ? Settings.taper_profile : nil,
           applied_local: Geom::Transformation.new,
           moved: false,
           sticky: false,
@@ -1919,8 +1997,9 @@ module Ban
           axis = spec[:axis]
           anchor = spec[:anchor]
           factors = spec[:factors]
+          profile = drag[:profile] || Settings.taper_profile
           drag[:vertex_set].apply do |world|
-            DeformMath.taper_point(box, axis, anchor, factors, world)
+            DeformMath.taper_point(box, axis, anchor, factors, world, profile)
           end
         end
       end
@@ -2259,20 +2338,40 @@ module Ban
       end
 
       # 拖动时输入框（VCB）的解析规则：
-      #   1.5x / *1.5   -> 比例
-      #   100 / -100    -> 无单位数值（拉伸 = 按模型单位的增量，收分 = 比例）
-      #   100mm / 3"    -> 带单位的长度
+      #   100 / 100mm       -> 目标尺寸（绝对值；输入多少就缩放到多少）
+      #   +100 / -100       -> 增量（相对值，正数增加、负数减少）
+      #   1.5x / *1.5       -> 比例
+      # 收分模式下：无单位数字 = 收分比；带单位 = 收分端截面尺寸。
       def parse_value(text)
-        value = text.strip
-        return nil if value.empty?
+        raw = text.to_s.strip
+        return nil if raw.empty?
 
-        if value =~ /\A[xX*]\s*([-+]?(?:\d+\.?\d*|\.\d+))\z/ ||
-           value =~ /\A([-+]?(?:\d+\.?\d*|\.\d+))\s*[xX*]\z/
-          { kind: :ratio, value: Regexp.last_match(1).to_f }
-        elsif value =~ /\A[-+]?(?:\d+\.?\d*|\.\d+)\z/
-          { kind: :number, value: value.to_f }
-        elsif value =~ /\A[-+]?(?:\d+\.?\d*|\.\d+)\s*[a-zA-Z"'°]+\z/
-          { kind: :length, value: value.to_l.to_f }
+        if raw =~ /\A[xX*]\s*([-+]?(?:\d+\.?\d*|\.\d+))\z/ ||
+           raw =~ /\A([-+]?(?:\d+\.?\d*|\.\d+))\s*[xX*]\z/
+          return { kind: :ratio, ratio: Regexp.last_match(1).to_f }
+        end
+
+        sign = nil
+        body = raw
+        if body =~ /\A([-+])\s*(.+)\z/
+          sign = Regexp.last_match(1)
+          body = Regexp.last_match(2).strip
+        end
+        return nil if body.empty?
+
+        if body =~ /\A(?:\d+\.?\d*|\.\d+)\z/
+          number = body.to_f
+          number = -number if sign == '-'
+          { kind: :number, number: number, signed: !sign.nil?,
+            inches: number * model_unit_factor }
+        elsif body =~ /\A(?:\d+\.?\d*|\.\d+)\s*[a-zA-Z"'°]/
+          begin
+            inches = body.to_l.to_f
+          rescue StandardError
+            return nil
+          end
+          inches = -inches if sign == '-'
+          { kind: :length, inches: inches, signed: !sign.nil? }
         end
       end
 
@@ -2288,33 +2387,45 @@ module Ban
       end
 
       def stretch_spec_from_values(values, handle, box)
+        axes = handle[:type] == :corner ? [0, 1, 2] : [handle[:axis]]
+
         if values.size == 1
           value = values.first
-          axes = handle[:type] == :corner ? [0, 1, 2] : [handle[:axis]]
-
           if value[:kind] == :ratio
             sizes = box.sizes.dup
             anchors = [0, 0, 0]
             axes.each do |axis|
               anchors[axis] = 1 - axis_side_of(handle, axis)
-              sizes[axis] = DeformBox.clamp_size(box.sizes[axis] * value[:value])
+              sizes[axis] = DeformBox.clamp_size(box.sizes[axis] * value[:ratio])
             end
-            { kind: :stretch, anchors: anchors, sizes: sizes }
-          else
-            delta = delta_of(value)
-            spec_from_deltas(axes.map { |axis| [axis, delta] }, handle, box)
+            return { kind: :stretch, anchors: anchors, sizes: sizes }
           end
+
+          spec_from_targets(axes.map { |axis| [axis, target_inches(box.sizes[axis], value)] },
+                            handle, box)
         elsif values.size == 3
           return nil if values.any? { |value| value[:kind] == :ratio }
 
-          list = (0...3).map { |axis| [axis, delta_of(values[axis])] }
-          spec_from_deltas(list, handle, box)
+          spec_from_targets(
+            (0...3).map { |axis| [axis, target_inches(box.sizes[axis], values[axis])] },
+            handle, box
+          )
         end
       end
 
-      # 无单位数值按模型单位换算成英寸增量
-      def delta_of(value)
-        value[:kind] == :number ? value[:value] * model_unit_factor : value[:value]
+      # 目标尺寸：无符号 = 绝对值；带 +/- = 在当前尺寸上增减
+      def target_inches(base, value)
+        value[:signed] ? base + value[:inches] : value[:inches]
+      end
+
+      def spec_from_targets(list, handle, box)
+        sizes = box.sizes.dup
+        anchors = [0, 0, 0]
+        list.each do |axis, target|
+          anchors[axis] = 1 - axis_side_of(handle, axis)
+          sizes[axis] = DeformBox.clamp_size(target)
+        end
+        { kind: :stretch, anchors: anchors, sizes: sizes }
       end
 
       def taper_spec_from_values(values, handle, box)
@@ -2327,17 +2438,20 @@ module Ban
           when 1
             value = values.first
             if value[:kind] == :ratio || value[:kind] == :number
-              [value[:value], value[:value]]
+              factor = value[:kind] == :ratio ? value[:ratio] : value[:number]
+              [factor, factor]
             else
-              perpendicular.map { |j| value[:value] / box.sizes[j] }
+              perpendicular.map { |j| value[:inches] / box.sizes[j] }
             end
           when 2
             perpendicular.each_with_index.map do |j, index|
               value = values[index]
-              if value[:kind] == :ratio || value[:kind] == :number
-                value[:value]
+              if value[:kind] == :ratio
+                value[:ratio]
+              elsif value[:kind] == :number
+                value[:number]
               else
-                value[:value] / box.sizes[j]
+                value[:inches] / box.sizes[j]
               end
             end
           else
@@ -2345,7 +2459,8 @@ module Ban
           end
 
         { kind: :taper, axis: axis, anchor: anchor,
-          factors: factors.map { |factor| DeformMath.clamp_factor(factor) } }
+          factors: factors.map { |factor| DeformMath.clamp_factor(factor) },
+          profile: @drag[:profile] || Settings.taper_profile }
       end
 
       # ---- 界面提示 ------------------------------------------------------
@@ -2355,7 +2470,7 @@ module Ban
           locked = "已锁定框 #{handle_axis_label(@drag[:handle])} 轴"
           Sketchup.status_text =
             "变形中（#{MODE_LABEL[@mode]}）：#{locked} —— 移动鼠标缩放，再点一下应用；" \
-            '右键「精确输入…」可输入增量（正数延长 / 负数缩短）；Esc 取消。'
+            '右键「精确输入…」输入目标尺寸（+100 / -100 才是增量）；Esc 取消。'
           set_vcb(vcb_label, vcb_value)
         elsif @state == STATE_SELECT
           Sketchup.status_text =
@@ -2364,9 +2479,11 @@ module Ban
             (@message.empty? ? '' : "  [#{@message}]")
           set_vcb('', '')
         else
+          curve_hint = @mode == :taper ? '右键「收分曲线」可选 S 形 / 鼓形 / 收腰；' : ''
           Sketchup.status_text =
             "变形框收分缩放（#{MODE_LABEL[@mode]}）：点一下手柄锁定方向轴 → 移动鼠标缩放 → 再点一下应用；" \
-            '也可直接按住拖动；右键「精确输入…」输入增量；点左上角「切换模式」按钮切换 拉伸/收分；' \
+            '也可直接按住拖动；右键「精确输入…」输入目标尺寸（+100 / -100 为增量）；' \
+            "#{curve_hint}点左上角「切换模式」按钮切换 拉伸/收分；" \
             'Ctrl(Windows)/Option(Mac) 点手柄 = 变形副本；Esc 退出。' +
             (@message.empty? ? '' : "  [#{@message}]")
           set_vcb('变形框', @box ? format_sizes(@box.sizes) : '')
@@ -2374,7 +2491,7 @@ module Ban
       end
 
       def vcb_label
-        @mode == :taper ? '收分比' : '比例/尺寸'
+        @mode == :taper ? '收分比' : '目标尺寸 / 比例'
       end
 
       def vcb_value
@@ -2382,8 +2499,11 @@ module Ban
         return '' unless spec
 
         if spec[:kind] == :stretch
-          text = describe_spec(spec)
-          text.empty? ? '0' : text
+          # VCB 里显示的是"目标尺寸"，和输入语义一致（不再是增量）
+          box = @drag[:base_box]
+          changed = (0...3).select { |axis| (spec[:sizes][axis] - box.sizes[axis]).abs > 1.0e-9 }
+          changed = (0...3).to_a if changed.empty?
+          changed.map { |axis| format('%.2f', spec[:sizes][axis] / model_unit_factor) }.join(',')
         else
           spec[:factors].map { |factor| format('%.3f', factor) }.join(', ')
         end
@@ -2475,17 +2595,54 @@ module Ban
         return unless spec && spec[:kind] == :taper
         return unless @drag[:moved]
 
-        box = @drag[:base_box]
-        axis = spec[:axis]
-        anchor = spec[:anchor]
-        factors = spec[:factors]
-        mapper = lambda { |point| DeformMath.taper_point(box, axis, anchor, factors, point) }
-
         view.line_stipple = '-'
         view.line_width = 2
         view.drawing_color = COLOR_TAPER_GUIDE
-        view.draw(GL_LINES, box_edges(box, mapper))
+        view.draw(GL_LINES, taper_guide_segments(spec))
         view.line_stipple = ''
+      rescue StandardError
+        nil
+      end
+
+      # 变形后的收分轮廓：沿轴的 4 条棱按曲线采样（鼓形 / 花瓶才看得出弧线），
+      # 两端截面各画一个矩形。
+      def taper_guide_segments(spec)
+        drag = @drag
+        box = drag[:base_box]
+        axis = spec[:axis]
+        anchor = spec[:anchor]
+        factors = spec[:factors]
+        profile = drag[:profile] || Settings.taper_profile
+        perpendicular = DeformMath.perpendicular_axes(axis)
+
+        at = lambda do |along, first, second|
+          fractions = [0.0, 0.0, 0.0]
+          fractions[axis] = along
+          fractions[perpendicular[0]] = first
+          fractions[perpendicular[1]] = second
+          point = box.point_at(fractions[0], fractions[1], fractions[2])
+          DeformMath.taper_point(box, axis, anchor, factors, point, profile)
+        end
+
+        segments = []
+        [0, 1].each do |first|
+          [0, 1].each do |second|
+            previous = nil
+            (0..TAPER_CURVE_SAMPLES).each do |step|
+              point = at.call(step.to_f / TAPER_CURVE_SAMPLES, first, second)
+              segments << previous << point if previous
+              previous = point
+            end
+          end
+        end
+
+        [0.0, 1.0].each do |along|
+          ring = [[0, 0], [0, 1], [1, 1], [1, 0]].map { |first, second| at.call(along, first, second) }
+          ring.each_with_index do |point, index|
+            segments << point << ring[(index + 1) % ring.size]
+          end
+        end
+        segments
       end
 
       def draw_handles(view)
@@ -2533,8 +2690,12 @@ module Ban
           elsif Settings.middle_stretch? && @drag[:vertex_set]
             lines << '保持造型：中部没有平直的切分位置，本次按整体缩放'
           end
-        elsif @state == STATE_EDIT && Settings.middle_stretch? && !Settings.stretch_zones.empty?
-          lines << "拉伸区（面心拉伸）：#{zone_label(Settings.stretch_zones)}"
+        elsif @state == STATE_EDIT
+          if @mode == :taper
+            lines << "收分曲线：#{DeformMath.profile_label(Settings.taper_profile)}"
+          elsif Settings.middle_stretch? && !Settings.stretch_zones.empty?
+            lines << "拉伸区（面心拉伸）：#{zone_label(Settings.stretch_zones)}"
+          end
         end
         spec = @drag && @drag[:spec]
 
@@ -2544,6 +2705,7 @@ module Ban
         elsif spec
           lines << "收分比：#{spec[:factors].map { |f| format('%.3f', f) }.join(' : ')}"
           lines << "端面尺寸：#{format_sizes(end_face_sizes(spec))}"
+          lines << "收分曲线：#{DeformMath.profile_label(@drag[:profile] || Settings.taper_profile)}"
         elsif @box
           lines << "变形框：#{format_sizes(@box.sizes)}"
         end
