@@ -29,6 +29,7 @@ module BanTaperScaleSelfTest
 
     model = Sketchup.active_model
     clean_up(model)
+    check_curve_math
 
     model.start_operation('收分缩放自检', true)
     begin
@@ -111,6 +112,25 @@ module BanTaperScaleSelfTest
   end
 
   # ---- 断言 ---------------------------------------------------------------
+
+  # 收分曲线是纯数学，不需要建几何：顺便确认加载的是 v1.6.0+ 的代码
+  def self.check_curve_math
+    unless MATH.respond_to?(:taper_scale)
+      check('收分曲线：当前加载的插件不是 v1.6.0+（缺少 taper_scale）', false)
+      return
+    end
+
+    linear_mid = MATH.taper_scale(0.5, 0.5)
+    bulge_mid = MATH.taper_scale(0.5, 0.5, { curve: :linear, bulge: 0.3 })
+    check('收分曲线：直线 + 曲度 0 仍是旧行为', near?(linear_mid, 0.75), linear_mid.to_s)
+    check('收分曲线：曲度 +0.3 让中段外鼓', near?(bulge_mid, 1.05), bulge_mid.to_s)
+
+    shape = { curve: :smooth, bulge: 0.3 }
+    check('收分曲线：固定端截面不变', near?(MATH.taper_scale(0.0, 0.5, shape), 1.0),
+          MATH.taper_scale(0.0, 0.5, shape).to_s)
+    check('收分曲线：收分端截面仍精确等于收分比', near?(MATH.taper_scale(1.0, 0.5, shape), 0.5),
+          MATH.taper_scale(1.0, 0.5, shape).to_s)
+  end
 
   def self.check_baseline(vertices)
     bottom = bottom_vertices(vertices)
