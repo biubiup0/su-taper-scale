@@ -73,11 +73,15 @@ module Ban
       COLOR_BOX_ACTIVE    = Sketchup::Color.new(255, 152, 0)
       COLOR_BOX_TAPER     = Sketchup::Color.new(150, 90, 220)
       COLOR_TAPER_GUIDE   = Sketchup::Color.new(0, 168, 122)
-      COLOR_FACE_HANDLE   = Sketchup::Color.new(0, 122, 255)
+      # 面心手柄 / 极轴参考线按 SketchUp 坐标轴配色：
+      # X（左右）红、Y（前后）绿、Z（上下）蓝
+      COLOR_AXIS_X        = Sketchup::Color.new(230, 40, 40)
+      COLOR_AXIS_Y        = Sketchup::Color.new(30, 165, 55)
+      COLOR_AXIS_Z        = Sketchup::Color.new(40, 90, 230)
+      AXIS_COLORS         = [COLOR_AXIS_X, COLOR_AXIS_Y, COLOR_AXIS_Z].freeze
       COLOR_CORNER_HANDLE = Sketchup::Color.new(255, 255, 255)
       COLOR_HOT           = Sketchup::Color.new(255, 140, 0)
       COLOR_DRAG          = Sketchup::Color.new(255, 45, 0)
-      COLOR_AXIS_LOCK     = Sketchup::Color.new(0, 170, 120)
       COLOR_PREVIEW       = Sketchup::Color.new(0, 200, 255)
       COLOR_SNAP          = Sketchup::Color.new(255, 0, 170)
       COLOR_ZONE          = Sketchup::Color.new(255, 120, 0)
@@ -1183,6 +1187,11 @@ module Ban
         end
       end
 
+      # 面心手柄 / 极轴参考线按轴配色：0 = X 红，1 = Y 绿，2 = Z 蓝
+      def axis_color(axis)
+        AXIS_COLORS[axis.to_i] || AXIS_COLORS[2]
+      end
+
       def draw_axis_line(view, box, axis, point)
         direction = box.axes[axis]
         reach = box.sizes[axis] * 0.75 + 2.0
@@ -1191,7 +1200,7 @@ module Ban
 
         view.line_stipple = '-'
         view.line_width = 2
-        view.drawing_color = COLOR_AXIS_LOCK
+        view.drawing_color = axis_color(axis)
         view.draw(GL_LINES, [first, second])
         view.line_stipple = ''
       end
@@ -2652,7 +2661,8 @@ module Ban
           elsif @hover && same_handle?(handle, @hover)
             view.draw_points([handle[:pos]], px(12), DRAW_FILLED_SQUARE, COLOR_HOT)
           elsif handle[:type] == :face
-            view.draw_points([handle[:pos]], px(9), DRAW_FILLED_TRIANGLE, COLOR_FACE_HANDLE)
+            view.draw_points([handle[:pos]], px(9), DRAW_FILLED_TRIANGLE,
+                             axis_color(handle[:axis]))
           else
             view.draw_points([handle[:pos]], px(8), DRAW_FILLED_SQUARE, COLOR_CORNER_HANDLE)
           end

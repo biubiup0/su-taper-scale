@@ -274,3 +274,14 @@ class SettingsTest < Minitest::Test
     assert_in_delta(-SETTINGS::MAX_TAPER_BULGE, SETTINGS.taper_profile[:bulge], 1e-9)
   end
 end
+
+class AxisColorTest < Minitest::Test
+  TOOL = Ban::TaperScale::Tool
+
+  def test_face_handle_colors_follow_sketchup_axes
+    tool = TestSupport.tool
+    assert_same TOOL::AXIS_COLORS[0], tool.send(:axis_color, 0) # X 红
+    assert_same TOOL::AXIS_COLORS[1], tool.send(:axis_color, 1) # Y 绿
+    assert_same TOOL::AXIS_COLORS[2], tool.send(:axis_color, 2) # Z 蓝
+  end
+end
